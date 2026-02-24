@@ -543,10 +543,11 @@ class MemoryEngine:
             commit=True,
         )
 
-    def forget_facts(self, session_id: str, pattern: str, user_id: str = "anonymous", tenant_id: str = "default") -> int:
+    def forget_facts(self, session_id: str, pattern: str, user_id: str = "anonymous", tenant_id: str = "default", include_user_tenant_scopes: bool = True) -> int:
         q = f"%{pattern}%"
+        scope_clause = "(session_id = ? OR memory_scope IN ('user','tenant'))" if include_user_tenant_scopes else "session_id = ?"
         deleted = self._exec(
-            "DELETE FROM facts WHERE tenant_id = ? AND user_id = ? AND (session_id = ? OR memory_scope IN ('user','tenant')) AND (fact LIKE ? OR tag LIKE ?)",
+            "DELETE FROM facts WHERE tenant_id = ? AND user_id = ? AND " + scope_clause + " AND (fact LIKE ? OR tag LIKE ?)",
             (tenant_id, user_id, session_id, q, q),
             commit=True,
         ).rowcount or 0
@@ -572,22 +573,31 @@ class MemoryEngine:
             (tenant_id, user_id, session_id, now, query, q, q, limit),
         ).fetchall()
 
-        out: List[str] = []
-        for r in rows:
-            new_rel = self._relevance(float(r["relevance_base"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
-            self._exec(
-                "UPDATE facts SET hit_count = hit_count + 1, relevance_score = ?, memory_status = ?, last_accessed_at = ?, updated_at = ? WHERE id = ?",
-                (new_rel, self._status(new_rel), now, now, int(r["id"])),
-                commit=True,
-            )
-            out.append(str(r["fact"]))
-        return out
+        return [str(r["fact"]) for r in rows]
 
     def previous_session_facts(self, session_id: str, user_id: str = "anonymous", tenant_id: str = "default", limit: int = 3) -> List[str]:
-        row = self._exec(
-            "SELECT session_id FROM interactions WHERE tenant_id = ? AND user_id = ? AND session_id != ? ORDER BY created_at DESC LIMIT 1",
+        current_latest = self._exec(
+            "SELECT COALESCE(MAX(created_at), 0) AS ts FROM interactions WHERE tenant_id = ? AND user_id = ? AND session_id = ?",
             (tenant_id, user_id, session_id),
         ).fetchone()
+        current_ts = int(current_latest["ts"] or 0)
+        row = self._exec(
+            """
+            SELECT session_id, MAX(created_at) AS last_ts
+            FROM interactions
+            WHERE tenant_id = ? AND user_id = ? AND session_id != ?
+            GROUP BY session_id
+            HAVING (? = 0 OR MAX(created_at) <= ?)
+            ORDER BY last_ts DESC
+            LIMIT 1
+            """,
+            (tenant_id, user_id, session_id, current_ts, current_ts),
+        ).fetchone()
+        if not row:
+            row = self._exec(
+                "SELECT session_id FROM interactions WHERE tenant_id = ? AND user_id = ? AND session_id != ? GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT 1",
+                (tenant_id, user_id, session_id),
+            ).fetchone()
         if not row:
             return []
         prev_session = str(row["session_id"])
@@ -595,17 +605,7 @@ class MemoryEngine:
             "SELECT id, fact, relevance_score, COALESCE(relevance_base, 1.0) AS relevance_base, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? ORDER BY relevance_score DESC, updated_at DESC LIMIT ?",
             (tenant_id, user_id, prev_session, limit),
         ).fetchall()
-        now = int(time.time())
-        facts = []
-        for r in rows:
-            new_rel = self._relevance(float(r["relevance_base"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
-            self._exec(
-                "UPDATE facts SET hit_count = hit_count + 1, relevance_score = ?, memory_status = ?, last_accessed_at = ?, updated_at = ? WHERE id = ?",
-                (new_rel, self._status(new_rel), now, now, int(r["id"])),
-                commit=True,
-            )
-            facts.append(str(r["fact"]))
-        return facts
+        return [str(r["fact"]) for r in rows]
 
     def tenant_topic_trends(self, tenant_id: str, limit: int = 3) -> List[str]:
         rows = self._exec(
@@ -1238,8 +1238,6 @@ class MemoryEngine:
                         user_id=str(data.get("user_id", "anonymous")),
                         tenant_id=tenant_id,
                     )
-                else:
-                    return False
             elif target_store == "entities" and proposal_type == "add":
                 if not str(data.get("entity_name", "")).strip():
                     return False
@@ -1396,7 +1394,8 @@ class MemoryEngine:
             params.append(session_id)
         where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-        select_sql = "SELECT id, relevance_score, COALESCE(relevance_base, 1.0) AS relevance_base, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts" + where_sql
+        status_filter = " AND memory_status != 'archived'" if where_sql else " WHERE memory_status != 'archived'"
+        select_sql = "SELECT id, relevance_score, COALESCE(relevance_base, 1.0) AS relevance_base, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts" + where_sql + status_filter
         rows = self._exec(select_sql, tuple(params)).fetchall()
         for r in rows:
             score = self._relevance(float(r["relevance_base"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))

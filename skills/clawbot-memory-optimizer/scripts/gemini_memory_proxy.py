@@ -208,7 +208,7 @@ def maybe_generate_summary(session_id: str, user_id: str, tenant_id: str) -> Non
             "Falls möglich wichtige stabile Präferenzen benennen.\n\n" + "\n".join(lines)
         )
         summary_text = scrub_pii(call_gemini(summary_prompt))
-        if summary_text.startswith("["):
+        if summary_text.startswith("[Fehler]") or summary_text.startswith("[Demo-Antwort]"):
             logger.warning("Skipping summary write due to Gemini error/demo response")
             SUMMARY_RETRY_AFTER[scope] = time.time() + SUMMARY_RETRY_DELAY_S
             return
@@ -375,7 +375,13 @@ def chat() -> Any:
         forget_pattern = extract_forget_pattern(user_prompt)
         if not forget_pattern:
             forget_pattern = user_prompt
-        deleted = engine.forget_facts(session_id=session_id, pattern=forget_pattern, user_id=user_id, tenant_id=tenant_id)
+        deleted = engine.forget_facts(
+            session_id=session_id,
+            pattern=forget_pattern,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            include_user_tenant_scopes=False,
+        )
         reply = f"Ich habe {deleted} passende Erinnerungen entfernt."
         engine.remember_turn(session_id, "assistant", reply, user_id=user_id, tenant_id=tenant_id)
         engine.record_metric(session_id, "trigger_forget_hit", 1, user_id=user_id, tenant_id=tenant_id)
