@@ -1406,6 +1406,13 @@ class MemoryEngine:
             params.append(session_id)
         where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
+        # Degrade stale priority first (before updated_at refreshes from relevance maintenance).
+        self._exec(
+            f"UPDATE facts SET priority = CASE WHEN priority > 1 THEN priority - 1 ELSE 1 END, updated_at = ? WHERE updated_at < ?" + (" AND " + " AND ".join(where_parts) if where_parts else ""),
+            (now, stale_cutoff, *params),
+            commit=True,
+        )
+
         status_filter = " AND memory_status != 'archived'" if where_sql else " WHERE memory_status != 'archived'"
         select_sql = "SELECT id, relevance_score, COALESCE(relevance_base, 1.0) AS relevance_base, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts" + where_sql + status_filter
         rows = self._exec(select_sql, tuple(params)).fetchall()
@@ -1416,12 +1423,6 @@ class MemoryEngine:
                 (score, self._status(score), now, int(r["id"])),
                 commit=True,
             )
-
-        self._exec(
-            f"UPDATE facts SET priority = CASE WHEN priority > 1 THEN priority - 1 ELSE 1 END, updated_at = ? WHERE updated_at < ?" + (" AND " + " AND ".join(where_parts) if where_parts else ""),
-            (now, stale_cutoff, *params),
-            commit=True,
-        )
 
         deleted_unhit = self._exec(
             f"DELETE FROM facts WHERE hit_count = 0 AND created_at < ? AND memory_scope = 'session'" + (" AND " + " AND ".join(where_parts) if where_parts else ""),

@@ -29,10 +29,10 @@ GEMINI_EMBED_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/model
 
 PII_PATTERNS = [
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[EMAIL]"),
-    (re.compile(r"\+?\d[\d\s\-/()]{6,}\d"), "[PHONE]"),
     (re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b"), "[IBAN]"),
     (re.compile(r"\b(?:\d{4}[- ]?){3}\d{4}\b"), "[CARD]"),
     (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
+    (re.compile(r"\b\+?\d[\d\s\-/()]{6,}\d\b"), "[PHONE]"),
 ]
 
 FACT_PATTERNS = [
@@ -102,41 +102,35 @@ def _parse_llm_json(raw: str) -> Any:
             text = parts[1]
             if text.lower().startswith("json"):
                 text = text[4:].strip()
+    def _extract_balanced(s: str, open_ch: str, close_ch: str) -> Optional[str]:
+        start = s.find(open_ch)
+        if start < 0:
+            return None
+        depth = 0
+        for i in range(start, len(s)):
+            ch = s[i]
+            if ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return s[start:i + 1]
+        return None
+
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        def _extract_balanced(s: str, open_ch: str, close_ch: str) -> Optional[str]:
-            start = s.find(open_ch)
-            if start < 0:
-                return None
-            depth = 0
-            for i in range(start, len(s)):
-                ch = s[i]
-                if ch == open_ch:
-                    depth += 1
-                elif ch == close_ch:
-                    depth -= 1
-                    if depth == 0:
-                        return s[start:i + 1]
-            return None
-
+        for candidate in (_extract_balanced(text, "{", "}"), _extract_balanced(text, "[", "]")):
+            if candidate:
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
         match = re.search(r"(\[.*?\]|\{.*?\})", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(1))
             except json.JSONDecodeError:
-                obj = _extract_balanced(text, "{", "}")
-                if obj:
-                    try:
-                        return json.loads(obj)
-                    except json.JSONDecodeError:
-                        pass
-                arr = _extract_balanced(text, "[", "]")
-                if arr:
-                    try:
-                        return json.loads(arr)
-                    except json.JSONDecodeError:
-                        pass
                 return None
         return None
 
@@ -338,12 +332,12 @@ class ReflectionTriggerHandler:
 
     def detect_trigger(self, user_input: str) -> Optional[str]:
         t = user_input.lower()
+        if any(x in t for x in REFLECTION_SCHEDULED_TRIGGERS):
+            return "scheduled"
         if any(x in t for x in REFLECTION_EXPLICIT_TRIGGERS):
             return "explicit"
         if any(x in t for x in REFLECTION_SOFT_TRIGGERS):
             return "soft"
-        if any(x in t for x in REFLECTION_SCHEDULED_TRIGGERS):
-            return "scheduled"
         return None
 
     def handle(self, user_input: str, tenant_id: str, user_id: str) -> Optional[dict]:
