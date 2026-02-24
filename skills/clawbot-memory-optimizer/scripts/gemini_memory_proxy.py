@@ -79,6 +79,8 @@ engine.init_db()
 LAST_MAINTENANCE_AT = 0.0
 MAINTENANCE_INTERVAL_S = int(os.getenv("MAINTENANCE_INTERVAL_S", "60"))
 MAINTENANCE_LOCK = threading.Lock()
+SUMMARY_RETRY_AFTER: dict[tuple[str, str, str], float] = {}
+SUMMARY_RETRY_DELAY_S = int(os.getenv("SUMMARY_RETRY_DELAY_S", "180"))
 
 
 def _safe_int(value: Any, default: int, minimum: Optional[int] = None) -> int:
@@ -97,8 +99,8 @@ def _parse_llm_json(raw: str) -> Any:
         parts = text.split("```")
         if len(parts) >= 3:
             text = parts[1]
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -186,6 +188,10 @@ def maybe_extract_fact(user_prompt: str) -> Optional[tuple[str, str, float, str]
 
 
 def maybe_generate_summary(session_id: str, user_id: str, tenant_id: str) -> None:
+    scope = (tenant_id, user_id, session_id)
+    retry_after = SUMMARY_RETRY_AFTER.get(scope, 0.0)
+    if retry_after > time.time():
+        return
     if not engine.needs_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id):
         return
     if not engine.try_acquire_summary_lock(session_id=session_id, user_id=user_id, tenant_id=tenant_id):
@@ -202,6 +208,7 @@ def maybe_generate_summary(session_id: str, user_id: str, tenant_id: str) -> Non
         summary_text = scrub_pii(call_gemini(summary_prompt))
         if summary_text.startswith("["):
             logger.warning("Skipping summary write due to Gemini error/demo response")
+            SUMMARY_RETRY_AFTER[scope] = time.time() + SUMMARY_RETRY_DELAY_S
             return
         engine.create_summary(
             session_id,
@@ -331,6 +338,16 @@ def track_topic_metrics(session_id: str, prompt: str, user_id: str, tenant_id: s
             engine.record_metric(session_id, f"topic_{tag}", 1, user_id=user_id, tenant_id=tenant_id)
 
 
+def extract_forget_pattern(prompt: str) -> str:
+    text = prompt.strip().lower()
+    for trig in FORGET_TRIGGERS:
+        if trig in text:
+            text = text.replace(trig, " ")
+    text = re.sub(r"\b(alles|everything|über|about|bitte|please|das|this|that|my|meine|mein)\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" .,!?:;-")
+    return text
+
+
 @app.post("/chat")
 def chat() -> Any:
     start = time.perf_counter()
@@ -352,12 +369,17 @@ def chat() -> Any:
             LAST_MAINTENANCE_AT = now_ts
 
     if _has_any(user_prompt, FORGET_TRIGGERS):
-        deleted = engine.forget_facts(session_id=session_id, pattern=user_prompt, user_id=user_id, tenant_id=tenant_id)
+        engine.remember_turn(session_id, "user", user_prompt, user_id=user_id, tenant_id=tenant_id)
+        forget_pattern = extract_forget_pattern(user_prompt)
+        if not forget_pattern:
+            forget_pattern = user_prompt
+        deleted = engine.forget_facts(session_id=session_id, pattern=forget_pattern, user_id=user_id, tenant_id=tenant_id)
         engine.record_metric(session_id, "trigger_forget_hit", 1, user_id=user_id, tenant_id=tenant_id)
         return jsonify({"response": f"Ich habe {deleted} passende Erinnerungen entfernt.", "source": "trigger_forget", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
 
     reflection_signal = reflection_handler.handle(user_prompt, tenant_id=tenant_id, user_id=user_id)
     if reflection_signal:
+        engine.remember_turn(session_id, "user", user_prompt, user_id=user_id, tenant_id=tenant_id)
         engine.record_metric(session_id, "trigger_reflect_hit", 1, user_id=user_id, tenant_id=tenant_id)
         return jsonify({
             "response": reflection_signal["message"],

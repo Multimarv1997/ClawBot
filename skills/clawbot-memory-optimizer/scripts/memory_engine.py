@@ -720,7 +720,7 @@ class MemoryEngine:
             pending_reflection = self.get_pending_reflection(tenant_id=tenant_id, user_id=user_id)
             if pending_reflection:
                 blocks.append(self._format_block("Ausstehende Reflexion", [f"id={pending_reflection['id']} tokens={pending_reflection['tokens_requested']}"], 40))
-            pending_props = self.get_pending_proposals(tenant_id=tenant_id, agent_name=user_id, limit=3)
+            pending_props = self.get_pending_proposals(tenant_id=tenant_id, limit=3)
             if pending_props:
                 prop_lines = [f"[{p['agent_name']}] {p['target_store']}:{p['proposal_type']}" for p in pending_props]
                 blocks.append(self._format_block("Ausstehende Proposals", prop_lines, 50))
@@ -800,7 +800,7 @@ class MemoryEngine:
             (tenant_id,),
         ).fetchall()
         rendered = [f"[{r['stability']}] {r['category']}: {r['content']}" for r in rows]
-        return [line[2:] if line.startswith("- ") else line for line in self._fit_lines_to_budget(rendered, max_tokens=max_tokens)]
+        return self._fit_lines_to_budget(rendered, max_tokens=max_tokens)
 
     def soul_context(self, tenant_id: str, max_tokens: int = 120) -> List[str]:
         rows = self._exec(
@@ -808,7 +808,7 @@ class MemoryEngine:
             (tenant_id,),
         ).fetchall()
         rendered = [f"{r['category']}: {r['content']}" for r in rows]
-        return [line[2:] if line.startswith("- ") else line for line in self._fit_lines_to_budget(rendered, max_tokens=max_tokens)]
+        return self._fit_lines_to_budget(rendered, max_tokens=max_tokens)
 
     def _log_audit(self, tenant_id: str, user_id: str, action_type: str, target_store: str, target_id: Optional[int], details: dict) -> None:
         now = int(time.time())
@@ -1158,8 +1158,8 @@ class MemoryEngine:
         )
         if not ok:
             self._exec(
-                "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND status = 'approved'",
-                (reviewer_agent, "execution_failed", now, now, proposal_id),
+                "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND status = 'approved'",
+                (reviewer_agent, "execution_failed", now, now, proposal_id, tenant_id),
                 commit=True,
             )
             self._log_audit(tenant_id, f"agent:{reviewer_agent}", "proposal_reject", str(row["target_store"]), proposal_id, {"original_agent": str(row["agent_name"]), "proposal_type": str(row["proposal_type"]), "reason": "execution_failed"})
@@ -1184,8 +1184,8 @@ class MemoryEngine:
             return False
         now = int(time.time())
         self._exec(
-            "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ?",
-            (reviewer_agent, rejection_reason[:240], now, now, proposal_id),
+            "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ?",
+            (reviewer_agent, rejection_reason[:240], now, now, proposal_id, tenant_id),
             commit=True,
         )
         self._log_audit(tenant_id, f"agent:{reviewer_agent}", "proposal_reject", str(row["target_store"]), proposal_id, {"original_agent": str(row["agent_name"]), "proposal_type": str(row["proposal_type"]), "reason": rejection_reason[:240]})
@@ -1428,10 +1428,9 @@ class MemoryEngine:
         where_sql = " WHERE " + " AND ".join(where_parts)
         exact = self._exec("DELETE FROM exact_cache_entries" + where_sql, tuple(params), commit=True).rowcount or 0
         semantic = self._exec("DELETE FROM semantic_cache_entries" + where_sql, tuple(params), commit=True).rowcount or 0
-        self._exec("DELETE FROM facts WHERE expires_at IS NOT NULL AND " + " AND ".join(where_parts), tuple(params), commit=True)
-        deleted_facts = 0
+        deleted_facts = self._exec("DELETE FROM facts WHERE expires_at IS NOT NULL AND " + " AND ".join(where_parts), tuple(params), commit=True).rowcount or 0
         if tenant_id is not None or user_id is not None or session_id is not None:
-            deleted_facts = self.apply_fact_maintenance(tenant_id=tenant_id, user_id=user_id, session_id=session_id)
+            deleted_facts += self.apply_fact_maintenance(tenant_id=tenant_id, user_id=user_id, session_id=session_id)
         return int(exact + semantic + deleted_facts)
 
 
