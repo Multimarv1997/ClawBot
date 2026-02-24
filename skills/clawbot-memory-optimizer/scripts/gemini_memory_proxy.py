@@ -40,6 +40,14 @@ FACT_PATTERNS = [
 ]
 
 
+ENTITY_PATTERNS = [
+    (re.compile(r"\b(projekt|project)\s+([A-Za-z0-9_-]{2,})", re.IGNORECASE), "project"),
+    (re.compile(r"\b(kunde|client)\s+([A-Za-z0-9_-]{2,})", re.IGNORECASE), "client"),
+    (re.compile(r"\b(thema|topic)\s+([A-Za-z0-9_-]{2,})", re.IGNORECASE), "topic"),
+]
+ENABLE_LLM_ENTITY_EXTRACTION = os.getenv("ENABLE_LLM_ENTITY_EXTRACTION", "0") == "1"
+
+
 REMEMBER_TRIGGERS = ["remember", "don't forget", "keep in mind", "note that", "save this", "merke dir", "vergiss nicht", "wichtig"]
 FORGET_TRIGGERS = ["forget", "never mind", "disregard", "remove from memory", "vergiss", "streichen", "egal"]
 REFLECT_TRIGGERS = ["reflect", "review memory", "consolidate", "reflektiere", "gedächtnis prüfen"]
@@ -169,6 +177,52 @@ def extract_facts_with_llm(text: str) -> list[dict]:
         return []
 
 
+
+
+def extract_entities_rule(text: str) -> list[dict]:
+    out: list[dict] = []
+    for pattern, etype in ENTITY_PATTERNS:
+        for m in pattern.finditer(text):
+            name = m.group(2).strip()
+            if len(name) >= 2:
+                out.append({"name": name, "type": etype, "confidence": 0.7})
+    return out
+
+
+def extract_entities_with_llm(text: str) -> list[dict]:
+    if not ENABLE_LLM_ENTITY_EXTRACTION:
+        return []
+    prompt = (
+        "Extrahiere bis zu 5 Entitäten als JSON-Liste mit Feldern name, type, confidence (0..1).\n"
+        f"Text:\n{text}"
+    )
+    raw = call_gemini(prompt)
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def update_knowledge_graph_from_fact(fact_text: str, tenant_id: str, user_id: str) -> None:
+    entities = extract_entities_rule(fact_text)
+    entities.extend(extract_entities_with_llm(fact_text))
+    dedup = {}
+    for e in entities:
+        name = str(e.get("name", "")).strip()
+        if not name:
+            continue
+        dedup[name.lower()] = {
+            "name": name,
+            "type": str(e.get("type", "concept")),
+            "confidence": float(e.get("confidence", 0.7)),
+        }
+    ids: list[int] = []
+    for ent in dedup.values():
+        ids.append(engine.upsert_entity(tenant_id=tenant_id, user_id=user_id, entity_name=ent["name"], entity_type=ent["type"], confidence=max(0.0, min(1.0, ent["confidence"]))))
+    for i in range(len(ids) - 1):
+        engine.upsert_relation(tenant_id=tenant_id, user_id=user_id, source_entity_id=ids[i], target_entity_id=ids[i + 1], relation_type="co_mentioned", strength=0.6)
+
 def track_topic_metrics(session_id: str, prompt: str, user_id: str, tenant_id: str) -> None:
     for pattern, tag, _, _ in FACT_PATTERNS:
         if pattern.search(prompt):
@@ -216,6 +270,7 @@ def chat() -> Any:
             tenant_id=tenant_id,
         )
         engine.record_metric(session_id, "fact_extracted_rule", 1, user_id=user_id, tenant_id=tenant_id)
+        update_knowledge_graph_from_fact(fact_text, tenant_id=tenant_id, user_id=user_id)
         if _has_any(user_prompt, REMEMBER_TRIGGERS):
             engine.record_metric(session_id, "trigger_remember_hit", 1, user_id=user_id, tenant_id=tenant_id)
 
@@ -243,6 +298,7 @@ def chat() -> Any:
             tenant_id=tenant_id,
         )
         engine.record_metric(session_id, "fact_extracted_llm", 1, user_id=user_id, tenant_id=tenant_id)
+        update_knowledge_graph_from_fact(fact_text, tenant_id=tenant_id, user_id=user_id)
 
     exact = engine.get_cached(session_id, user_prompt, user_id=user_id, tenant_id=tenant_id)
     if exact:

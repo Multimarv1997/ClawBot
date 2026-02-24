@@ -23,3 +23,6 @@ description: "Installierbarer Skill für ClawBot mit RAM-sparendem SQLite-Memory
 14. Aktiviere Trigger-Flow: `remember`, `forget`, `reflect` für automatische Memory-Aktionen.
 15. Nutze Decay-Model (`relevance_score`, `memory_status`) für priorisiertes Gedächtnis.
 16. Halte Phase-B/C-Tabellen (`entities`, `relations`, `identity`, `soul`) für spätere Ausbaustufe bereit.
+
+17. Aktiviere Phase B: Entity-Extraktion (Regel + optional LLM) und Graph-Recall über `entities`/`relations`.
+18. Halte Phase-C-Komponenten (`identity`, `soul`) vorbereitet, aber noch ohne aktive Persona-Injektion.

@@ -462,6 +462,69 @@ class MemoryEngine:
         ).fetchall()
         return [f"{str(r['metric_name']).replace('topic_', '')}: {int(float(r['total']))}" for r in rows]
 
+
+    def upsert_entity(self, tenant_id: str, user_id: str, entity_name: str, entity_type: str = "concept", description: str = "", confidence: float = 0.7) -> int:
+        now = int(time.time())
+        key = entity_name.strip().lower()
+        row = self._exec(
+            "SELECT id, confidence FROM entities WHERE tenant_id = ? AND user_id = ? AND LOWER(entity_name) = ? LIMIT 1",
+            (tenant_id, user_id, key),
+        ).fetchone()
+        if row:
+            self._exec(
+                "UPDATE entities SET entity_type = ?, description = CASE WHEN ? != '' THEN ? ELSE description END, confidence = MAX(confidence, ?), updated_at = ? WHERE id = ?",
+                (entity_type, description, description, confidence, now, int(row["id"])),
+                commit=True,
+            )
+            return int(row["id"])
+        cur = self._exec(
+            "INSERT INTO entities(tenant_id, user_id, entity_name, entity_type, description, confidence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (tenant_id, user_id, entity_name.strip(), entity_type, description, confidence, now, now),
+            commit=True,
+        )
+        return int(cur.lastrowid)
+
+    def upsert_relation(self, tenant_id: str, user_id: str, source_entity_id: int, target_entity_id: int, relation_type: str = "related_to", strength: float = 0.7) -> None:
+        row = self._exec(
+            "SELECT id, strength FROM relations WHERE tenant_id = ? AND user_id = ? AND source_entity_id = ? AND target_entity_id = ? AND relation_type = ? LIMIT 1",
+            (tenant_id, user_id, source_entity_id, target_entity_id, relation_type),
+        ).fetchone()
+        now = int(time.time())
+        if row:
+            self._exec(
+                "UPDATE relations SET strength = MAX(strength, ?), created_at = ? WHERE id = ?",
+                (strength, now, int(row["id"])),
+                commit=True,
+            )
+            return
+        self._exec(
+            "INSERT INTO relations(tenant_id, user_id, source_entity_id, target_entity_id, relation_type, strength, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tenant_id, user_id, source_entity_id, target_entity_id, relation_type, strength, now),
+            commit=True,
+        )
+
+    def graph_top_entities(self, tenant_id: str, user_id: str, limit: int = 5) -> List[str]:
+        rows = self._exec(
+            "SELECT entity_name, confidence FROM entities WHERE tenant_id = ? AND user_id = ? ORDER BY confidence DESC, updated_at DESC LIMIT ?",
+            (tenant_id, user_id, limit),
+        ).fetchall()
+        return [f"{r['entity_name']} ({float(r['confidence']):.2f})" for r in rows]
+
+    def graph_top_relations(self, tenant_id: str, user_id: str, limit: int = 5) -> List[str]:
+        rows = self._exec(
+            """
+            SELECT e1.entity_name AS src, e2.entity_name AS dst, r.relation_type AS rel, r.strength AS st
+            FROM relations r
+            JOIN entities e1 ON e1.id = r.source_entity_id
+            JOIN entities e2 ON e2.id = r.target_entity_id
+            WHERE r.tenant_id = ? AND r.user_id = ?
+            ORDER BY r.strength DESC, r.created_at DESC
+            LIMIT ?
+            """,
+            (tenant_id, user_id, limit),
+        ).fetchall()
+        return [f"{r['src']} -[{r['rel']}]-> {r['dst']} ({float(r['st']):.2f})" for r in rows]
+
     def latest_summary(self, session_id: str, user_id: str = "anonymous", tenant_id: str = "default") -> Optional[str]:
         row = self._exec(
             "SELECT summary FROM summaries WHERE tenant_id = ? AND user_id = ? AND session_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -488,6 +551,8 @@ class MemoryEngine:
         facts = self.top_facts(session_id, query=query, user_id=user_id, tenant_id=tenant_id)
         prev = self.previous_session_facts(session_id, user_id=user_id, tenant_id=tenant_id)
         trends = self.tenant_topic_trends(tenant_id=tenant_id)
+        entities = self.graph_top_entities(tenant_id=tenant_id, user_id=user_id, limit=4)
+        relations = self.graph_top_relations(tenant_id=tenant_id, user_id=user_id, limit=4)
         recent = self.recent_turns(session_id, user_id=user_id, tenant_id=tenant_id)
         return (
             (f"Zusammenfassung:\n{summary}" if summary else "Zusammenfassung:\n(nicht vorhanden)")
@@ -497,6 +562,10 @@ class MemoryEngine:
             + ("\n".join([f"- {f}" for f in prev]) if prev else "(keine)")
             + "\n\nTenant Trends:\n"
             + ("\n".join([f"- {t}" for t in trends]) if trends else "(keine)")
+            + "\n\nGraph Entitäten:\n"
+            + ("\n".join([f"- {e}" for e in entities]) if entities else "(keine)")
+            + "\n\nGraph Relationen:\n"
+            + ("\n".join([f"- {r}" for r in relations]) if relations else "(keine)")
             + "\n\nLetzte Turns:\n"
             + "\n".join(recent)
         ).strip()

@@ -1,18 +1,17 @@
 # Architektur: zuverlässiges Memory für ClawBot
 
-## Phase A (umgesetzt)
-1. **Decay-basiertes Vergessen**
-   - `relevance_score` + `memory_status` (`active|fading|dormant|archived`)
-   - Decay-Logik bei Fact-Zugriff und in Wartungsjobs
-2. **Natural Language Triggers**
-   - Trigger für `remember`, `forget`, `reflect` im Proxy-Flow
-   - Trigger-Metriken zur Auswertung
-3. **Stabilität und Hygiene beibehalten**
-   - Summary-Locks, Embedding-Cleanup, PII-Schutz bleiben aktiv
+## Phase B (umgesetzt)
+1. **Wissensgraph erweitert**
+   - Tabellen `entities`, `relations` aktiv genutzt
+   - Entity-Extraktion aus Facts: Regel-basiert + optional LLM (`ENABLE_LLM_ENTITY_EXTRACTION=1`)
+2. **Graph-Recall im Kontext**
+   - `build_context()` enthält Top-Entitäten und Top-Relationen (top-k)
+3. **Vorhandene Basis beibehalten**
+   - Decay/Trigger/PII/Locks aus Phase A bleiben unverändert aktiv
 
-## Für Phase B/C vorbereitet
-- Tabellen vorbereitet: `entities`, `relations`, `identity`, `soul`
-- Fact-Schema vorbereitet mit `memory_type`, `relevance_score`, `memory_status`
+## Für Phase C vorbereitet
+- Tabellen `identity`, `soul` sind vorhanden
+- Fact- und Metrics-Basis erlaubt Identity-Injektion in den Kontext
 
 ## Kontextpipeline
-`summary -> top facts -> previous-session facts -> tenant trends -> recent turns`
+`summary -> top facts -> previous-session facts -> tenant trends -> graph entities/relations -> recent turns`
