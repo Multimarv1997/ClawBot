@@ -76,7 +76,6 @@ def _has_any(text: str, patterns: list[str]) -> bool:
 app = Flask(__name__)
 engine = MemoryEngine()
 engine.init_db()
-reflection_handler = ReflectionTriggerHandler(engine)
 
 
 def get_api_key() -> str:
@@ -294,6 +293,8 @@ class ReflectionTriggerHandler:
         }
 
 
+reflection_handler = ReflectionTriggerHandler(engine)
+
 def track_topic_metrics(session_id: str, prompt: str, user_id: str, tenant_id: str) -> None:
     for pattern, tag, _, _ in FACT_PATTERNS:
         if pattern.search(prompt):
@@ -470,6 +471,66 @@ def api_reflection_history() -> Any:
     user_id = str(request.args.get("user_id", "anonymous"))
     limit = int(request.args.get("limit", "10"))
     return jsonify({"items": engine.get_reflection_history(tenant_id=tenant_id, user_id=user_id, limit=limit)})
+
+
+@app.post("/api/agent/register")
+def api_agent_register() -> Any:
+    body = request.get_json(force=True)
+    aid = engine.register_agent(
+        tenant_id=str(body.get("tenant_id", "default")),
+        agent_name=str(body.get("agent_name", "")),
+        agent_type=str(body.get("agent_type", "subagent")),
+        permissions=str(body.get("permissions", "read")),
+    )
+    return jsonify({"agent_id": aid})
+
+
+@app.post("/api/proposal/submit")
+def api_proposal_submit() -> Any:
+    body = request.get_json(force=True)
+    pid = engine.submit_proposal(
+        tenant_id=str(body.get("tenant_id", "default")),
+        agent_name=str(body.get("agent_name", "")),
+        target_store=str(body.get("target_store", "facts")),
+        proposal_type=str(body.get("proposal_type", "add")),
+        content=str(body.get("content", "")),
+        confidence=str(body.get("confidence", "medium")),
+        priority=int(body.get("priority", 1)),
+    )
+    if pid is None:
+        return jsonify({"error": "not authorized or too many pending proposals"}), 403
+    return jsonify({"proposal_id": pid, "status": "pending"})
+
+
+@app.get("/api/proposal/pending")
+def api_proposal_pending() -> Any:
+    tenant_id = str(request.args.get("tenant_id", "default"))
+    target_store = request.args.get("target_store")
+    agent_name = request.args.get("agent_name")
+    limit = int(request.args.get("limit", "20"))
+    items = engine.get_pending_proposals(tenant_id=tenant_id, target_store=target_store, agent_name=agent_name, limit=limit)
+    return jsonify({"items": items})
+
+
+@app.post("/api/proposal/review")
+def api_proposal_review() -> Any:
+    body = request.get_json(force=True)
+    action = str(body.get("action", "reject"))
+    if action == "approve":
+        ok = engine.approve_proposal(
+            proposal_id=int(body.get("proposal_id", 0)),
+            tenant_id=str(body.get("tenant_id", "default")),
+            reviewer_agent=str(body.get("reviewer_agent", "")),
+            review_comment=str(body.get("comment", "")),
+        )
+    else:
+        ok = engine.reject_proposal(
+            proposal_id=int(body.get("proposal_id", 0)),
+            tenant_id=str(body.get("tenant_id", "default")),
+            reviewer_agent=str(body.get("reviewer_agent", "")),
+            rejection_reason=str(body.get("comment", "")),
+        )
+    return (jsonify({"status": "success"}), 200) if ok else (jsonify({"error": "review failed"}), 400)
 
 
 @app.get("/metrics")

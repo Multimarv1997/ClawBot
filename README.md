@@ -28,3 +28,10 @@ Installierbarer Skill für ClawBot mit disk-first Memory, exact/semantic cache, 
 - Reflection Approval-Workflow: `approve`, `reject`, `execute`, `history`
 - API-Endpunkte: `/api/reflection/request|approve|reject|execute|pending|history`
 - D3/D4 vorbereitet: Proposal/Audit-Fundament aus D1 bleibt intakt
+
+
+## Phase D3 umgesetzt (Multi-Agent Proposal Workflow)
+- Agent-Registry mit Rollen/Rechten (`read|propose|write`, inkl. Main-Agent-Review-Regel)
+- Proposal-Lifecycle: `submit -> pending -> approve/reject` mit direkter Ausführung bei Approve
+- Proposal-API: `/api/agent/register`, `/api/proposal/submit`, `/api/proposal/pending`, `/api/proposal/review`
+- Für D4 vorbereitet: Audit-/Retention-Basis und Governance-Statusfelder sind vorhanden

@@ -33,3 +33,6 @@ description: "Installierbarer Skill für ClawBot mit RAM-sparendem SQLite-Memory
 
 22. Setze D2 um: Reflection Queue MVP (Trigger + approve/reject/execute + history + Reflection-API).
 23. Belasse Multi-Agent-Proposals (D3) und erweiterte Governance/Analytics (D4) weiterhin als nächste Schritte.
+
+24. Setze D3 um: Multi-Agent Proposal-Workflow (Registry, Submit, Review/Execute).
+25. Halte D4 für Governance-Feinschliff, Analytics und Retention-Policies vorbereitet.

@@ -951,6 +951,209 @@ class MemoryEngine:
             })
         return out
 
+    def register_agent(self, tenant_id: str, agent_name: str, agent_type: str = "subagent", permissions: str = "read") -> int:
+        now = int(time.time())
+        a_type = "main" if agent_type == "main" else "subagent"
+        allowed = {"read", "propose", "write"}
+        perms = permissions if permissions in allowed else "read"
+        if a_type == "subagent" and perms == "write":
+            perms = "propose"
+        row = self._exec(
+            "SELECT id FROM agents WHERE tenant_id = ? AND agent_name = ?",
+            (tenant_id, agent_name),
+        ).fetchone()
+        if row:
+            self._exec(
+                "UPDATE agents SET agent_type = ?, permissions = ?, active = 1, last_active_at = ? WHERE id = ?",
+                (a_type, perms, now, int(row["id"])),
+                commit=True,
+            )
+            aid = int(row["id"])
+        else:
+            cur = self._exec(
+                "INSERT INTO agents(tenant_id, agent_name, agent_type, permissions, active, created_at, last_active_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                (tenant_id, agent_name, a_type, perms, now, now),
+                commit=True,
+            )
+            aid = int(cur.lastrowid)
+        self._log_audit(tenant_id, f"agent:{agent_name}", "agent_register", "agents", aid, {"agent_type": a_type, "permissions": perms})
+        return aid
+
+    def get_agent(self, tenant_id: str, agent_name: str) -> Optional[dict]:
+        row = self._exec(
+            "SELECT id, agent_name, agent_type, permissions, active, last_active_at FROM agents WHERE tenant_id = ? AND agent_name = ? AND active = 1",
+            (tenant_id, agent_name),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row["id"]),
+            "agent_name": str(row["agent_name"]),
+            "agent_type": str(row["agent_type"]),
+            "permissions": str(row["permissions"]),
+            "active": bool(row["active"]),
+            "last_active_at": int(row["last_active_at"]) if row["last_active_at"] else None,
+        }
+
+    def can_propose(self, tenant_id: str, agent_name: str) -> bool:
+        agent = self.get_agent(tenant_id, agent_name)
+        return bool(agent and agent["permissions"] in {"propose", "write"})
+
+    def submit_proposal(self, tenant_id: str, agent_name: str, target_store: str, proposal_type: str, content: str, confidence: str = "medium", priority: int = 1) -> Optional[int]:
+        if not self.can_propose(tenant_id, agent_name):
+            return None
+        c_row = self._exec(
+            "SELECT COUNT(*) AS c FROM memory_proposals WHERE tenant_id = ? AND agent_name = ? AND status = 'pending'",
+            (tenant_id, agent_name),
+        ).fetchone()
+        if int(c_row["c"]) >= self.config.max_pending_proposals:
+            return None
+        now = int(time.time())
+        prio = max(1, min(5, int(priority)))
+        conf = confidence if confidence in {"low", "medium", "high"} else "medium"
+        cur = self._exec(
+            "INSERT INTO memory_proposals(tenant_id, agent_name, target_store, proposal_type, content, confidence, status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+            (tenant_id, agent_name, target_store, proposal_type, content, conf, prio, now, now),
+            commit=True,
+        )
+        pid = int(cur.lastrowid)
+        self._log_audit(tenant_id, f"agent:{agent_name}", "proposal_submit", target_store, pid, {"proposal_type": proposal_type, "confidence": conf, "priority": prio})
+        return pid
+
+    def get_pending_proposals(self, tenant_id: str, target_store: Optional[str] = None, agent_name: Optional[str] = None, limit: int = 20) -> List[dict]:
+        query = "SELECT id, agent_name, target_store, proposal_type, content, confidence, priority, created_at FROM memory_proposals WHERE tenant_id = ? AND status = 'pending'"
+        params: list = [tenant_id]
+        if target_store:
+            query += " AND target_store = ?"
+            params.append(target_store)
+        if agent_name:
+            query += " AND agent_name = ?"
+            params.append(agent_name)
+        query += " ORDER BY priority DESC, created_at ASC LIMIT ?"
+        params.append(limit)
+        rows = self._exec(query, tuple(params)).fetchall()
+        return [{
+            "id": int(r["id"]),
+            "agent_name": str(r["agent_name"]),
+            "target_store": str(r["target_store"]),
+            "proposal_type": str(r["proposal_type"]),
+            "content": str(r["content"]),
+            "confidence": str(r["confidence"]),
+            "priority": int(r["priority"]),
+            "created_at": int(r["created_at"]),
+        } for r in rows]
+
+    def approve_proposal(self, proposal_id: int, tenant_id: str, reviewer_agent: str, review_comment: str = "") -> bool:
+        reviewer = self.get_agent(tenant_id, reviewer_agent)
+        if not reviewer or reviewer["permissions"] != "write":
+            return False
+        row = self._exec(
+            "SELECT * FROM memory_proposals WHERE id = ? AND tenant_id = ? AND status = 'pending'",
+            (proposal_id, tenant_id),
+        ).fetchone()
+        if not row:
+            return False
+        ok = self._execute_proposal_content(
+            tenant_id=tenant_id,
+            agent_name=str(row["agent_name"]),
+            target_store=str(row["target_store"]),
+            proposal_type=str(row["proposal_type"]),
+            content=str(row["content"]),
+        )
+        if not ok:
+            return False
+        now = int(time.time())
+        self._exec(
+            "UPDATE memory_proposals SET status = 'approved', reviewed_by = ?, review_comment = ?, approved_at = ?, executed_at = ?, updated_at = ? WHERE id = ?",
+            (reviewer_agent, review_comment[:240], now, now, now, proposal_id),
+            commit=True,
+        )
+        self._log_audit(tenant_id, f"agent:{reviewer_agent}", "proposal_approve", str(row["target_store"]), proposal_id, {"original_agent": str(row["agent_name"]), "proposal_type": str(row["proposal_type"])})
+        return True
+
+    def reject_proposal(self, proposal_id: int, tenant_id: str, reviewer_agent: str, rejection_reason: str = "") -> bool:
+        reviewer = self.get_agent(tenant_id, reviewer_agent)
+        if not reviewer or reviewer["permissions"] != "write":
+            return False
+        row = self._exec(
+            "SELECT agent_name, target_store, proposal_type FROM memory_proposals WHERE id = ? AND tenant_id = ? AND status = 'pending'",
+            (proposal_id, tenant_id),
+        ).fetchone()
+        if not row:
+            return False
+        now = int(time.time())
+        self._exec(
+            "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ?",
+            (reviewer_agent, rejection_reason[:240], now, now, proposal_id),
+            commit=True,
+        )
+        self._log_audit(tenant_id, f"agent:{reviewer_agent}", "proposal_reject", str(row["target_store"]), proposal_id, {"original_agent": str(row["agent_name"]), "proposal_type": str(row["proposal_type"]), "reason": rejection_reason[:240]})
+        return True
+
+    def _execute_proposal_content(self, tenant_id: str, agent_name: str, target_store: str, proposal_type: str, content: str) -> bool:
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return False
+        try:
+            if target_store == "facts":
+                if proposal_type == "add":
+                    self.remember_fact(
+                        session_id=str(data.get("session_id", "default")),
+                        fact=str(data.get("fact", "")).strip(),
+                        tag=str(data.get("tag", "proposed")),
+                        priority=int(data.get("priority", 1)),
+                        memory_scope=str(data.get("memory_scope", "user")),
+                        memory_type=str(data.get("memory_type", "semantic")),
+                        user_id=str(data.get("user_id", "anonymous")),
+                        tenant_id=tenant_id,
+                    )
+                elif proposal_type == "delete":
+                    self.forget_facts(
+                        session_id=str(data.get("session_id", "default")),
+                        pattern=str(data.get("pattern", "")),
+                        user_id=str(data.get("user_id", "anonymous")),
+                        tenant_id=tenant_id,
+                    )
+                else:
+                    return False
+            elif target_store == "entities" and proposal_type == "add":
+                self.upsert_entity(
+                    tenant_id=tenant_id,
+                    user_id=str(data.get("user_id", "anonymous")),
+                    entity_name=str(data.get("entity_name", "")).strip(),
+                    entity_type=str(data.get("entity_type", "concept")),
+                    description=str(data.get("description", "")),
+                    confidence=float(data.get("confidence", 0.7)),
+                )
+            elif target_store == "relations" and proposal_type == "add":
+                self.upsert_relation(
+                    tenant_id=tenant_id,
+                    user_id=str(data.get("user_id", "anonymous")),
+                    source_entity_id=int(data.get("source_entity_id", 0)),
+                    target_entity_id=int(data.get("target_entity_id", 0)),
+                    relation_type=str(data.get("relation_type", "related_to")),
+                    strength=float(data.get("strength", 0.7)),
+                )
+            elif target_store == "identity" and proposal_type in {"add", "update"}:
+                self.set_identity(
+                    tenant_id=tenant_id,
+                    category=str(data.get("category", "general")),
+                    content=str(data.get("content", "")).strip(),
+                    stability=str(data.get("stability", "dynamic")),
+                )
+            elif target_store == "soul" and proposal_type in {"add", "update"}:
+                self.set_soul(
+                    tenant_id=tenant_id,
+                    category=str(data.get("category", "values")),
+                    content=str(data.get("content", "")).strip(),
+                )
+            else:
+                return False
+            return True
+        except Exception:
+            return False
+
     @staticmethod
     def _hash_prompt(prompt: str) -> str:
         return hashlib.sha256(prompt.strip().encode("utf-8")).hexdigest()

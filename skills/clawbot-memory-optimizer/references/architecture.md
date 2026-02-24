@@ -43,3 +43,15 @@
    - request/approve/reject/execute/pending/history
 3. **Vorbereitung für D3/D4**
    - Proposal-Tabellen und Audit-Basis aus D1 bleiben unverändert und bereit
+
+
+## Phase D3 (umgesetzt)
+1. **Multi-Agent Proposal-Workflow aktiv**
+   - Agenten-Registrierung (`main`/`subagent`) mit Permission-Gates
+   - Proposals: submit/list/review (approve/reject)
+2. **Ausführungslogik bei Approve**
+   - Target Stores: `facts`, `entities`, `relations`, `identity`, `soul`
+   - Main-Agent (`write`) als Reviewer erforderlich
+3. **Vorbereitung für D4**
+   - Audit- und Retention-Basis bleibt intakt
+   - Erweiterte Governance/Analytics können darauf aufbauen

@@ -48,6 +48,22 @@ def main() -> None:
     print("Executed:", engine.execute_reflection(rid, tenant_id=tenant, user_id=user, reflection_text="Kurze Reflexion: Nutzer möchte kurze Antworten."))
     print("History:", engine.get_reflection_history(tenant_id=tenant, user_id=user, limit=3))
 
+    print("\nProposal Workflow Demo:")
+    engine.register_agent(tenant_id=tenant, agent_name="main", agent_type="main", permissions="write")
+    engine.register_agent(tenant_id=tenant, agent_name="research_agent", agent_type="subagent", permissions="propose")
+    pid = engine.submit_proposal(
+        tenant_id=tenant,
+        agent_name="research_agent",
+        target_store="facts",
+        proposal_type="add",
+        content='{"session_id":"s1","user_id":"alice","fact":"User arbeitet an Phase D.","tag":"project","memory_scope":"user"}',
+        confidence="high",
+        priority=3,
+    )
+    print("Proposal ID:", pid)
+    print("Pending Proposals:", engine.get_pending_proposals(tenant_id=tenant, limit=3))
+    print("Approved Proposal:", engine.approve_proposal(proposal_id=int(pid or 0), tenant_id=tenant, reviewer_agent="main", review_comment="looks good"))
+
 
 if __name__ == "__main__":
     main()
