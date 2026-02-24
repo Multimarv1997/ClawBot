@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HTTP-Proxy mit exact + semantic cache, robustem PII-Filter und besserem Summary/Fact Flow."""
+"""HTTP-Proxy mit exact+semantic cache, verbessertem Cross-Session-Memory und Fact-Management."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import requests
 from flask import Flask, jsonify, request
@@ -33,9 +33,9 @@ PII_PATTERNS = [
 ]
 
 FACT_PATTERNS = [
-    (re.compile(r"\bich bevorzuge\b", re.IGNORECASE), "preference", 0.85),
-    (re.compile(r"\bmein name ist\b", re.IGNORECASE), "identity", 0.70),
-    (re.compile(r"\bbitte antworte\b", re.IGNORECASE), "style", 0.9),
+    (re.compile(r"\bich bevorzuge\b", re.IGNORECASE), "preference", 0.85, "user"),
+    (re.compile(r"\bmein name ist\b", re.IGNORECASE), "identity", 0.70, "user"),
+    (re.compile(r"\bbitte antworte\b", re.IGNORECASE), "style", 0.9, "session"),
 ]
 
 app = Flask(__name__)
@@ -70,7 +70,7 @@ def embed_text(text: str) -> List[float]:
         resp = requests.post(
             GEMINI_EMBED_ENDPOINT,
             params={"key": api_key},
-            json={"content": {"parts": [{"text": text}]}} ,
+            json={"content": {"parts": [{"text": text}]}},
             timeout=30,
         )
         resp.raise_for_status()
@@ -97,7 +97,6 @@ def call_gemini(prompt: str) -> str:
     except requests.RequestException as err:
         logger.error("Gemini call failed: %s", err)
         return "[Fehler] Gemini aktuell nicht erreichbar."
-
     data = resp.json()
     try:
         return str(data["candidates"][0]["content"]["parts"][0]["text"])
@@ -105,13 +104,13 @@ def call_gemini(prompt: str) -> str:
         return str(data)
 
 
-def maybe_extract_fact(user_prompt: str) -> Optional[tuple[str, str, float]]:
+def maybe_extract_fact(user_prompt: str) -> Optional[tuple[str, str, float, str]]:
     text = user_prompt.strip()
     if len(text) < 12:
         return None
-    for pattern, tag, conf in FACT_PATTERNS:
+    for pattern, tag, conf, scope in FACT_PATTERNS:
         if pattern.search(text):
-            return (text[:400], tag, conf)
+            return (text[:400], tag, conf, scope)
     return None
 
 
@@ -121,22 +120,26 @@ def maybe_generate_summary(session_id: str, user_id: str, tenant_id: str) -> Non
     turns = engine.turns_since_last_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id, limit=24)
     if len(turns) < 8:
         return
-
     lines = [f"{r['role']}: {r['content']}" for r in turns]
     summary_prompt = (
         "Fasse die folgenden Dialogturns in 4 Stichpunkten zusammen, neutral und kurz.\n"
         "Falls möglich wichtige stabile Präferenzen benennen.\n\n" + "\n".join(lines)
     )
     summary_text = scrub_pii(call_gemini(summary_prompt))
-    from_turn_id = int(turns[0]["id"])
-    to_turn_id = int(turns[-1]["id"])
-    engine.create_summary(session_id, summary_text, from_turn_id, to_turn_id, user_id=user_id, tenant_id=tenant_id)
+    engine.create_summary(
+        session_id,
+        summary_text,
+        int(turns[0]["id"]),
+        int(turns[-1]["id"]),
+        user_id=user_id,
+        tenant_id=tenant_id,
+    )
     engine.record_metric(session_id, "summary_created", 1, user_id=user_id, tenant_id=tenant_id)
 
 
 def extract_facts_with_llm(text: str) -> list[dict]:
     payload = (
-        "Extrahiere bis zu 3 wichtige Fakten als JSON-Liste mit Feldern fact, tag, confidence (0..1).\n"
+        "Extrahiere bis zu 3 wichtige Fakten als JSON-Liste mit Feldern fact, tag, confidence (0..1) und scope (session|user).\n"
         f"Text:\n{text}"
     )
     raw = call_gemini(payload)
@@ -145,6 +148,12 @@ def extract_facts_with_llm(text: str) -> list[dict]:
         return data if isinstance(data, list) else []
     except json.JSONDecodeError:
         return []
+
+
+def track_topic_metrics(session_id: str, prompt: str, user_id: str, tenant_id: str) -> None:
+    for pattern, tag, _, _ in FACT_PATTERNS:
+        if pattern.search(prompt):
+            engine.record_metric(session_id, f"topic_{tag}", 1, user_id=user_id, tenant_id=tenant_id)
 
 
 @app.post("/chat")
@@ -158,20 +167,49 @@ def chat() -> Any:
     if not user_prompt:
         return jsonify({"error": "prompt fehlt"}), 400
 
+    track_topic_metrics(session_id, user_prompt, user_id, tenant_id)
     turn_id = engine.remember_turn(session_id, "user", user_prompt, user_id=user_id, tenant_id=tenant_id)
 
-    fact = maybe_extract_fact(user_prompt)
-    if fact:
-        fact_text, tag, confidence = fact
-        engine.remember_fact(session_id, fact_text, tag=tag, confidence=confidence, source_turn_id=turn_id, expires_at=int(time.time()) + 30 * 24 * 3600, user_id=user_id, tenant_id=tenant_id)
-        engine.record_metric(session_id, "fact_extracted", 1, user_id=user_id, tenant_id=tenant_id)
+    rule_fact = maybe_extract_fact(user_prompt)
+    if rule_fact:
+        fact_text, tag, confidence, scope = rule_fact
+        engine.remember_fact(
+            session_id,
+            fact_text,
+            tag=tag,
+            confidence=confidence,
+            source_turn_id=turn_id,
+            expires_at=int(time.time()) + 30 * 24 * 3600,
+            memory_scope=scope,
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        engine.record_metric(session_id, "fact_extracted_rule", 1, user_id=user_id, tenant_id=tenant_id)
 
     llm_facts = extract_facts_with_llm(user_prompt)
     for f in llm_facts[:3]:
         fact_text = scrub_pii(str(f.get("fact", "")).strip())
         if not fact_text:
             continue
-        engine.remember_fact(session_id, fact_text, tag=str(f.get("tag", "llm")), confidence=float(f.get("confidence", 0.7)), source_turn_id=turn_id, expires_at=int(time.time()) + 30 * 24 * 3600, user_id=user_id, tenant_id=tenant_id)
+        scope = str(f.get("scope", "session"))
+        if scope not in {"session", "user", "tenant"}:
+            scope = "session"
+        try:
+            conf = float(f.get("confidence", 0.7))
+        except (TypeError, ValueError):
+            conf = 0.7
+        engine.remember_fact(
+            session_id,
+            fact_text,
+            tag=str(f.get("tag", "llm")),
+            confidence=max(0.0, min(1.0, conf)),
+            source_turn_id=turn_id,
+            expires_at=int(time.time()) + 30 * 24 * 3600,
+            memory_scope=scope,
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        engine.record_metric(session_id, "fact_extracted_llm", 1, user_id=user_id, tenant_id=tenant_id)
 
     exact = engine.get_cached(session_id, user_prompt, user_id=user_id, tenant_id=tenant_id)
     if exact:
