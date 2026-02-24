@@ -200,6 +200,9 @@ def maybe_generate_summary(session_id: str, user_id: str, tenant_id: str) -> Non
             "Falls möglich wichtige stabile Präferenzen benennen.\n\n" + "\n".join(lines)
         )
         summary_text = scrub_pii(call_gemini(summary_prompt))
+        if summary_text.startswith("["):
+            logger.warning("Skipping summary write due to Gemini error/demo response")
+            return
         engine.create_summary(
             session_id,
             summary_text,
@@ -344,7 +347,7 @@ def chat() -> Any:
     now_ts = time.time()
     with MAINTENANCE_LOCK:
         if now_ts - LAST_MAINTENANCE_AT >= MAINTENANCE_INTERVAL_S:
-            engine.cleanup_stale_phase_d_state()
+            engine.cleanup_stale_phase_d_state(tenant_id=tenant_id)
             engine.apply_fact_maintenance(tenant_id=tenant_id, user_id=user_id)
             LAST_MAINTENANCE_AT = now_ts
 
@@ -388,6 +391,21 @@ def chat() -> Any:
         if _has_any(user_prompt, REMEMBER_TRIGGERS):
             engine.record_metric(session_id, "trigger_remember_hit", 1, user_id=user_id, tenant_id=tenant_id)
 
+    exact = engine.get_cached(session_id, user_prompt, user_id=user_id, tenant_id=tenant_id)
+    if exact:
+        engine.remember_turn(session_id, "assistant", exact, user_id=user_id, tenant_id=tenant_id)
+        engine.record_metric(session_id, "exact_cache_hit", 1, user_id=user_id, tenant_id=tenant_id)
+        engine.record_metric(session_id, "request_latency_ms", (time.perf_counter() - start) * 1000, user_id=user_id, tenant_id=tenant_id)
+        return jsonify({"response": exact, "source": "exact_cache", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
+
+    semantic = engine.get_semantic_cached(session_id, user_prompt, embedder=embed_text, user_id=user_id, tenant_id=tenant_id)
+    if semantic:
+        engine.remember_turn(session_id, "assistant", semantic, user_id=user_id, tenant_id=tenant_id)
+        engine.set_cached(session_id, user_prompt, semantic, user_id=user_id, tenant_id=tenant_id)
+        engine.record_metric(session_id, "semantic_cache_hit", 1, user_id=user_id, tenant_id=tenant_id)
+        engine.record_metric(session_id, "request_latency_ms", (time.perf_counter() - start) * 1000, user_id=user_id, tenant_id=tenant_id)
+        return jsonify({"response": semantic, "source": "semantic_cache", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
+
     llm_facts = extract_facts_with_llm(user_prompt)
     for f in llm_facts[:3]:
         fact_text = scrub_pii(str(f.get("fact", "")).strip())
@@ -414,21 +432,6 @@ def chat() -> Any:
         engine.record_metric(session_id, "fact_extracted_llm", 1, user_id=user_id, tenant_id=tenant_id)
         update_knowledge_graph_from_fact(fact_text, tenant_id=tenant_id, user_id=user_id)
         apply_identity_and_soul_rules(fact_text, tag=str(f.get("tag", "llm")), tenant_id=tenant_id)
-
-    exact = engine.get_cached(session_id, user_prompt, user_id=user_id, tenant_id=tenant_id)
-    if exact:
-        engine.remember_turn(session_id, "assistant", exact, user_id=user_id, tenant_id=tenant_id)
-        engine.record_metric(session_id, "exact_cache_hit", 1, user_id=user_id, tenant_id=tenant_id)
-        engine.record_metric(session_id, "request_latency_ms", (time.perf_counter() - start) * 1000, user_id=user_id, tenant_id=tenant_id)
-        return jsonify({"response": exact, "source": "exact_cache", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
-
-    semantic = engine.get_semantic_cached(session_id, user_prompt, embedder=embed_text, user_id=user_id, tenant_id=tenant_id)
-    if semantic:
-        engine.remember_turn(session_id, "assistant", semantic, user_id=user_id, tenant_id=tenant_id)
-        engine.set_cached(session_id, user_prompt, semantic, user_id=user_id, tenant_id=tenant_id)
-        engine.record_metric(session_id, "semantic_cache_hit", 1, user_id=user_id, tenant_id=tenant_id)
-        engine.record_metric(session_id, "request_latency_ms", (time.perf_counter() - start) * 1000, user_id=user_id, tenant_id=tenant_id)
-        return jsonify({"response": semantic, "source": "semantic_cache", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
 
     maybe_generate_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id)
     include_governance = bool(body.get("include_governance_context", False))

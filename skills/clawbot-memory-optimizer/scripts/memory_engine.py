@@ -86,6 +86,13 @@ class MemoryEngine:
                 raise
 
     def _ensure_column(self, table: str, column_def: str, column_name: str) -> None:
+        allowed_tables = {
+            "interactions", "facts", "summaries", "metrics", "exact_cache_entries", "semantic_cache_entries",
+            "entities", "relations", "identity", "soul", "summary_locks", "reflection_queue", "reflection_log",
+            "agents", "memory_proposals", "audit_log",
+        }
+        if table not in allowed_tables:
+            raise ValueError(f"unsupported table for schema migration: {table}")
         cols = [r[1] for r in self._exec(f"PRAGMA table_info({table})").fetchall()]
         if column_name not in cols:
             self._exec(f"ALTER TABLE {table} ADD COLUMN {column_def}", commit=True)
@@ -514,7 +521,10 @@ class MemoryEngine:
             conflict_group = None
             old_fact = str(existing["fact"]).lower()
             new_fact = fact.lower()
-            if ("nicht" in old_fact and "nicht" not in new_fact) or ("nicht" in new_fact and "nicht" not in old_fact):
+            neg_markers = ("nicht", "not", "never", "kein", "keine", "no ")
+            old_neg = any(m in old_fact for m in neg_markers)
+            new_neg = any(m in new_fact for m in neg_markers)
+            if old_neg != new_neg:
                 conflict_group = fact_key
             self._exec(
                 "UPDATE facts SET fact = ?, tag = ?, confidence = ?, priority = ?, hit_count = hit_count + 1, relevance_score = ?, relevance_base = MAX(COALESCE(relevance_base, 1.0), ?), memory_status = ?, source_turn_id = COALESCE(?, source_turn_id), expires_at = COALESCE(?, expires_at), conflict_group = COALESCE(?, conflict_group), updated_at = ?, last_accessed_at = ? WHERE id = ?",
@@ -847,16 +857,18 @@ class MemoryEngine:
         deleted = self._exec("DELETE FROM audit_log WHERE created_at < ?", (cutoff,), commit=True).rowcount or 0
         return int(deleted)
 
-    def cleanup_stale_phase_d_state(self) -> dict:
+    def cleanup_stale_phase_d_state(self, tenant_id: Optional[str] = None) -> dict:
         now = int(time.time())
         proposal_cutoff = now - self.config.proposal_auto_expire_hours * 3600
+        tenant_filter = " AND tenant_id = ?" if tenant_id is not None else ""
+        tenant_params: tuple = (tenant_id,) if tenant_id is not None else ()
         expired_rows = self._exec(
-            "SELECT id, tenant_id, agent_name, target_store, proposal_type FROM memory_proposals WHERE status = 'pending' AND created_at < ?",
-            (proposal_cutoff,),
+            "SELECT id, tenant_id, agent_name, target_store, proposal_type FROM memory_proposals WHERE status = 'pending' AND created_at < ?" + tenant_filter,
+            (proposal_cutoff, *tenant_params),
         ).fetchall()
         expired_proposals = self._exec(
-            "UPDATE memory_proposals SET status = 'rejected', rejection_reason = COALESCE(rejection_reason, 'auto_expired'), rejected_at = ?, updated_at = ? WHERE status = 'pending' AND created_at < ?",
-            (now, now, proposal_cutoff),
+            "UPDATE memory_proposals SET status = 'rejected', rejection_reason = COALESCE(rejection_reason, 'auto_expired'), rejected_at = ?, updated_at = ? WHERE status = 'pending' AND created_at < ?" + tenant_filter,
+            (now, now, proposal_cutoff, *tenant_params),
             commit=True,
         ).rowcount or 0
         for row in expired_rows:
@@ -873,11 +885,11 @@ class MemoryEngine:
                 },
             )
         old_reflections = self._exec(
-            "DELETE FROM reflection_queue WHERE status IN ('executed', 'rejected') AND updated_at < ?",
-            (proposal_cutoff,),
+            "DELETE FROM reflection_queue WHERE status IN ('executed', 'rejected') AND updated_at < ?" + tenant_filter,
+            (proposal_cutoff, *tenant_params),
             commit=True,
         ).rowcount or 0
-        old_audit = self.cleanup_old_audit_logs()
+        old_audit = self.cleanup_old_audit_logs() if tenant_id is None else 0
         return {"expired_proposals": int(expired_proposals), "deleted_reflection_queue_rows": int(old_reflections), "deleted_audit_rows": int(old_audit)}
 
     def phase_d_health(self, tenant_id: str, user_id: str) -> dict:
@@ -1123,9 +1135,17 @@ class MemoryEngine:
         reviewer = self.get_agent(tenant_id, reviewer_agent)
         if not reviewer or reviewer["permissions"] != "write":
             return False
+        now = int(time.time())
+        claimed = self._exec(
+            "UPDATE memory_proposals SET status = 'approved', reviewed_by = ?, review_comment = ?, approved_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND status = 'pending'",
+            (reviewer_agent, review_comment[:240], now, now, proposal_id, tenant_id),
+            commit=True,
+        )
+        if (claimed.rowcount or 0) <= 0:
+            return False
         row = self._exec(
-            "SELECT * FROM memory_proposals WHERE id = ? AND tenant_id = ? AND status = 'pending'",
-            (proposal_id, tenant_id),
+            "SELECT * FROM memory_proposals WHERE id = ? AND tenant_id = ? AND status = 'approved' AND reviewed_by = ?",
+            (proposal_id, tenant_id, reviewer_agent),
         ).fetchone()
         if not row:
             return False
@@ -1137,18 +1157,16 @@ class MemoryEngine:
             content=str(row["content"]),
         )
         if not ok:
-            now = int(time.time())
             self._exec(
-                "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'",
+                "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND status = 'approved'",
                 (reviewer_agent, "execution_failed", now, now, proposal_id),
                 commit=True,
             )
             self._log_audit(tenant_id, f"agent:{reviewer_agent}", "proposal_reject", str(row["target_store"]), proposal_id, {"original_agent": str(row["agent_name"]), "proposal_type": str(row["proposal_type"]), "reason": "execution_failed"})
             return False
-        now = int(time.time())
         self._exec(
-            "UPDATE memory_proposals SET status = 'executed', reviewed_by = ?, review_comment = ?, approved_at = ?, executed_at = ?, updated_at = ? WHERE id = ?",
-            (reviewer_agent, review_comment[:240], now, now, now, proposal_id),
+            "UPDATE memory_proposals SET status = 'executed', executed_at = ?, updated_at = ? WHERE id = ? AND status = 'approved'",
+            (now, now, proposal_id),
             commit=True,
         )
         self._log_audit(tenant_id, f"agent:{reviewer_agent}", "proposal_approve", str(row["target_store"]), proposal_id, {"original_agent": str(row["agent_name"]), "proposal_type": str(row["proposal_type"])})
@@ -1364,10 +1382,8 @@ class MemoryEngine:
             params.append(session_id)
         where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-        rows = self._exec(
-            f"SELECT id, relevance_score, COALESCE(relevance_base, 1.0) AS relevance_base, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts{where_sql}",
-            tuple(params),
-        ).fetchall()
+        select_sql = "SELECT id, relevance_score, COALESCE(relevance_base, 1.0) AS relevance_base, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts" + where_sql
+        rows = self._exec(select_sql, tuple(params)).fetchall()
         for r in rows:
             score = self._relevance(float(r["relevance_base"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
             self._exec(
@@ -1398,9 +1414,21 @@ class MemoryEngine:
 
     def purge_expired_cache(self, tenant_id: Optional[str] = None, user_id: Optional[str] = None, session_id: Optional[str] = None) -> int:
         now = int(time.time())
-        exact = self._exec("DELETE FROM exact_cache_entries WHERE expires_at < ?", (now,), commit=True).rowcount or 0
-        semantic = self._exec("DELETE FROM semantic_cache_entries WHERE expires_at < ?", (now,), commit=True).rowcount or 0
-        self._exec("DELETE FROM facts WHERE expires_at IS NOT NULL AND expires_at < ?", (now,), commit=True)
+        where_parts = ["expires_at < ?"]
+        params: list = [now]
+        if tenant_id is not None:
+            where_parts.append("tenant_id = ?")
+            params.append(tenant_id)
+        if user_id is not None:
+            where_parts.append("user_id = ?")
+            params.append(user_id)
+        if session_id is not None:
+            where_parts.append("session_id = ?")
+            params.append(session_id)
+        where_sql = " WHERE " + " AND ".join(where_parts)
+        exact = self._exec("DELETE FROM exact_cache_entries" + where_sql, tuple(params), commit=True).rowcount or 0
+        semantic = self._exec("DELETE FROM semantic_cache_entries" + where_sql, tuple(params), commit=True).rowcount or 0
+        self._exec("DELETE FROM facts WHERE expires_at IS NOT NULL AND " + " AND ".join(where_parts), tuple(params), commit=True)
         deleted_facts = 0
         if tenant_id is not None or user_id is not None or session_id is not None:
             deleted_facts = self.apply_fact_maintenance(tenant_id=tenant_id, user_id=user_id, session_id=session_id)
