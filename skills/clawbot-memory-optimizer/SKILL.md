@@ -25,4 +25,5 @@ description: "Installierbarer Skill für ClawBot mit RAM-sparendem SQLite-Memory
 16. Halte Phase-B/C-Tabellen (`entities`, `relations`, `identity`, `soul`) für spätere Ausbaustufe bereit.
 
 17. Aktiviere Phase B: Entity-Extraktion (Regel + optional LLM) und Graph-Recall über `entities`/`relations`.
-18. Halte Phase-C-Komponenten (`identity`, `soul`) vorbereitet, aber noch ohne aktive Persona-Injektion.
+18. Nutze Phase C aktiv: `identity` (stabil + dynamisch) und `soul` für Werte/Prinzipien im Kontext.
+19. Erzwinge striktes Kontextbudget mit globalem Token-Limit plus Block-Budgets pro Speicherquelle.

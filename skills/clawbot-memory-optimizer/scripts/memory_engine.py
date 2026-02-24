@@ -30,6 +30,16 @@ class MemoryConfig:
     unhit_fact_days: int = 7
     decay_lambda: float = 0.03
     archive_threshold: float = 0.05
+    context_token_budget: int = 700
+    context_block_budget_identity: int = 120
+    context_block_budget_soul: int = 120
+    context_block_budget_summary: int = 120
+    context_block_budget_facts: int = 100
+    context_block_budget_prev_facts: int = 70
+    context_block_budget_trends: int = 50
+    context_block_budget_graph_entities: int = 60
+    context_block_budget_graph_relations: int = 60
+    context_block_budget_recent_turns: int = 160
 
 
 TYPE_WEIGHTS = {
@@ -263,6 +273,7 @@ class MemoryEngine:
             """,
             commit=True,
         )
+        self._exec("CREATE INDEX IF NOT EXISTS idx_identity_tenant_category_stability ON identity(tenant_id, category, stability, updated_at DESC)", commit=True)
         self._exec(
             """
             CREATE TABLE IF NOT EXISTS soul (
@@ -276,6 +287,7 @@ class MemoryEngine:
             """,
             commit=True,
         )
+        self._exec("CREATE INDEX IF NOT EXISTS idx_soul_tenant_category_time ON soul(tenant_id, category, updated_at DESC)", commit=True)
 
     def _scope(self, session_id: str, user_id: str, tenant_id: str) -> tuple[str, str, str]:
         return tenant_id, user_id, session_id
@@ -548,27 +560,111 @@ class MemoryEngine:
 
     def build_context(self, session_id: str, query: str = "", user_id: str = "anonymous", tenant_id: str = "default") -> str:
         summary = self.latest_summary(session_id, user_id=user_id, tenant_id=tenant_id) or ""
+        identity_facts = self.identity_context(tenant_id=tenant_id, max_tokens=self.config.context_block_budget_identity)
+        soul_values = self.soul_context(tenant_id=tenant_id, max_tokens=self.config.context_block_budget_soul)
         facts = self.top_facts(session_id, query=query, user_id=user_id, tenant_id=tenant_id)
         prev = self.previous_session_facts(session_id, user_id=user_id, tenant_id=tenant_id)
         trends = self.tenant_topic_trends(tenant_id=tenant_id)
         entities = self.graph_top_entities(tenant_id=tenant_id, user_id=user_id, limit=4)
         relations = self.graph_top_relations(tenant_id=tenant_id, user_id=user_id, limit=4)
         recent = self.recent_turns(session_id, user_id=user_id, tenant_id=tenant_id)
-        return (
-            (f"Zusammenfassung:\n{summary}" if summary else "Zusammenfassung:\n(nicht vorhanden)")
-            + "\n\nTop Facts:\n"
-            + "\n".join([f"- {f}" for f in facts])
-            + "\n\nFacts letzte Sitzung:\n"
-            + ("\n".join([f"- {f}" for f in prev]) if prev else "(keine)")
-            + "\n\nTenant Trends:\n"
-            + ("\n".join([f"- {t}" for t in trends]) if trends else "(keine)")
-            + "\n\nGraph Entitäten:\n"
-            + ("\n".join([f"- {e}" for e in entities]) if entities else "(keine)")
-            + "\n\nGraph Relationen:\n"
-            + ("\n".join([f"- {r}" for r in relations]) if relations else "(keine)")
-            + "\n\nLetzte Turns:\n"
-            + "\n".join(recent)
-        ).strip()
+
+        blocks = [
+            self._format_block("Identity (stabil)", identity_facts, self.config.context_block_budget_identity),
+            self._format_block("Soul (Werte/Prinzipien)", soul_values, self.config.context_block_budget_soul),
+            self._format_block("Zusammenfassung", [summary] if summary else ["(nicht vorhanden)"], self.config.context_block_budget_summary),
+            self._format_block("Top Facts", facts if facts else ["(keine)"], self.config.context_block_budget_facts),
+            self._format_block("Facts letzte Sitzung", prev if prev else ["(keine)"], self.config.context_block_budget_prev_facts),
+            self._format_block("Tenant Trends", trends if trends else ["(keine)"], self.config.context_block_budget_trends),
+            self._format_block("Graph Entitäten", entities if entities else ["(keine)"], self.config.context_block_budget_graph_entities),
+            self._format_block("Graph Relationen", relations if relations else ["(keine)"], self.config.context_block_budget_graph_relations),
+            self._format_block("Letzte Turns", recent if recent else ["(keine)"], self.config.context_block_budget_recent_turns),
+        ]
+        return self._cap_global_budget("\n\n".join(blocks), self.config.context_token_budget)
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        if not text:
+            return 0
+        return max(1, int(len(text) / 4))
+
+    def _fit_lines_to_budget(self, lines: List[str], max_tokens: int) -> List[str]:
+        out: List[str] = []
+        used = 0
+        for line in lines:
+            line_tokens = self._estimate_tokens(line)
+            if line_tokens <= 0:
+                continue
+            if used + line_tokens <= max_tokens:
+                out.append(line)
+                used += line_tokens
+                continue
+            remaining = max_tokens - used
+            if remaining <= 0:
+                break
+            approx_chars = max(8, remaining * 4)
+            out.append(line[: approx_chars - 1].rstrip() + "…")
+            used = max_tokens
+            break
+        return out
+
+    def _format_block(self, title: str, lines: List[str], max_tokens: int) -> str:
+        fitted = self._fit_lines_to_budget([f"- {l}" for l in lines], max_tokens=max_tokens)
+        body = "\n".join(fitted) if fitted else "- (leer)"
+        return f"{title}:\n{body}"
+
+    def _cap_global_budget(self, text: str, max_tokens: int) -> str:
+        if self._estimate_tokens(text) <= max_tokens:
+            return text
+        approx_chars = max_tokens * 4
+        return text[: approx_chars - 1].rstrip() + "…"
+
+    def set_identity(self, tenant_id: str, category: str, content: str, stability: str = "stable") -> None:
+        now = int(time.time())
+        st = "dynamic" if stability == "dynamic" else "stable"
+        row = self._exec(
+            "SELECT id FROM identity WHERE tenant_id = ? AND category = ? AND content = ? LIMIT 1",
+            (tenant_id, category, content),
+        ).fetchone()
+        if row:
+            self._exec("UPDATE identity SET updated_at = ?, stability = ? WHERE id = ?", (now, st, int(row["id"])), commit=True)
+            return
+        self._exec(
+            "INSERT INTO identity(tenant_id, category, content, stability, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (tenant_id, category, content, st, now, now),
+            commit=True,
+        )
+
+    def set_soul(self, tenant_id: str, category: str, content: str) -> None:
+        now = int(time.time())
+        row = self._exec(
+            "SELECT id FROM soul WHERE tenant_id = ? AND category = ? AND content = ? LIMIT 1",
+            (tenant_id, category, content),
+        ).fetchone()
+        if row:
+            self._exec("UPDATE soul SET updated_at = ? WHERE id = ?", (now, int(row["id"])), commit=True)
+            return
+        self._exec(
+            "INSERT INTO soul(tenant_id, category, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (tenant_id, category, content, now, now),
+            commit=True,
+        )
+
+    def identity_context(self, tenant_id: str, max_tokens: int = 120) -> List[str]:
+        rows = self._exec(
+            "SELECT category, content, stability FROM identity WHERE tenant_id = ? ORDER BY CASE stability WHEN 'stable' THEN 0 ELSE 1 END, updated_at DESC LIMIT 10",
+            (tenant_id,),
+        ).fetchall()
+        rendered = [f"[{r['stability']}] {r['category']}: {r['content']}" for r in rows]
+        return [line[2:] if line.startswith("- ") else line for line in self._fit_lines_to_budget(rendered, max_tokens=max_tokens)]
+
+    def soul_context(self, tenant_id: str, max_tokens: int = 120) -> List[str]:
+        rows = self._exec(
+            "SELECT category, content FROM soul WHERE tenant_id = ? ORDER BY updated_at DESC LIMIT 10",
+            (tenant_id,),
+        ).fetchall()
+        rendered = [f"{r['category']}: {r['content']}" for r in rows]
+        return [line[2:] if line.startswith("- ") else line for line in self._fit_lines_to_budget(rendered, max_tokens=max_tokens)]
 
     @staticmethod
     def _hash_prompt(prompt: str) -> str:

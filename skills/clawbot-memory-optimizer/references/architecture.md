@@ -9,9 +9,16 @@
 3. **Vorhandene Basis beibehalten**
    - Decay/Trigger/PII/Locks aus Phase A bleiben unverändert aktiv
 
-## Für Phase C vorbereitet
-- Tabellen `identity`, `soul` sind vorhanden
-- Fact- und Metrics-Basis erlaubt Identity-Injektion in den Kontext
+## Phase C (umgesetzt)
+1. **Identität & Konsistenz aktiviert**
+   - `identity`: stabile Fakten vs. dynamisches Self-Image
+   - `soul`: Werte/Prinzipien/Boundaries
+2. **Änderungsregeln**
+   - Stabile Identitätsfakten werden konservativ fortgeführt (`stability=stable`)
+   - Stil-/Zustandsnahe Aussagen landen als dynamisches Self-Image (`stability=dynamic`)
+3. **Striktes Tokenbudget**
+   - pro Kontextblock (Identity, Soul, Summary, Facts, Graph, Turns)
+   - globales Budget als harte Obergrenze
 
 ## Kontextpipeline
-`summary -> top facts -> previous-session facts -> tenant trends -> graph entities/relations -> recent turns`
+`identity -> soul -> summary -> top facts -> previous-session facts -> tenant trends -> graph entities/relations -> recent turns`

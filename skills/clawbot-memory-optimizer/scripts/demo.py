@@ -29,6 +29,10 @@ def main() -> None:
     )
     engine.create_summary(session, "- User möchte kurze deutsche Antworten.", 1, 1, user_id=user, tenant_id=tenant)
 
+    engine.set_identity(tenant_id=tenant, category="facts", content="Der Assistent antwortet klar und strukturiert.", stability="stable")
+    engine.set_identity(tenant_id=tenant, category="self_image", content="Heute antworte ich besonders kurz.", stability="dynamic")
+    engine.set_soul(tenant_id=tenant, category="principles", content="Datenschutz vor Bequemlichkeit.")
+
     p1 = "Bitte antworte kurz und auf deutsch"
     p2 = "Antworte mir auf deutsch, kurz bitte"
     engine.set_semantic_cached(session, p1, "Okay, ich antworte kurz auf Deutsch.", toy_embedder(p1), user_id=user, tenant_id=tenant)

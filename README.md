@@ -7,8 +7,10 @@ Installierbarer Skill für ClawBot mit disk-first Memory, exact/semantic cache, 
 - Wissensgraph mit `entities` und `relations` aktiv
 - Graph-gestütztes Recall im Context (`Top Entitäten`, `Top Relationen`)
 
-## Für Phase C vorbereitet
-- Identitäts-Tabellen (`identity`, `soul`) sind vorhanden
+## Phase C umgesetzt (Identität & Konsistenz)
+- `identity`/`soul` werden aktiv gepflegt (Regeln für stabile Fakten vs. dynamisches Self-Image)
+- Kontext enthält zusätzliche Blöcke: `Identity (stabil)` und `Soul (Werte/Prinzipien)`
+- Striktes Tokenbudget pro Kontextblock + globales Budget
 
 ## API
 - `POST /chat` mit `{ "tenant_id":"acme", "user_id":"alice", "session_id":"s1", "prompt":"..." }`

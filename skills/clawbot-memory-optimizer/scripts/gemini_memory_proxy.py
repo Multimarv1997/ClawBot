@@ -52,6 +52,12 @@ REMEMBER_TRIGGERS = ["remember", "don't forget", "keep in mind", "note that", "s
 FORGET_TRIGGERS = ["forget", "never mind", "disregard", "remove from memory", "vergiss", "streichen", "egal"]
 REFLECT_TRIGGERS = ["reflect", "review memory", "consolidate", "reflektiere", "gedächtnis prüfen"]
 
+SOUL_PATTERNS = [
+    (re.compile(r"\b(wert|werte|value|values)\b", re.IGNORECASE), "values"),
+    (re.compile(r"\b(prinzip|prinzipien|principle|principles)\b", re.IGNORECASE), "principles"),
+    (re.compile(r"\b(grenze|grenzen|boundary|boundaries)\b", re.IGNORECASE), "boundaries"),
+]
+
 
 def _has_any(text: str, patterns: list[str]) -> bool:
     t = text.lower()
@@ -223,6 +229,24 @@ def update_knowledge_graph_from_fact(fact_text: str, tenant_id: str, user_id: st
     for i in range(len(ids) - 1):
         engine.upsert_relation(tenant_id=tenant_id, user_id=user_id, source_entity_id=ids[i], target_entity_id=ids[i + 1], relation_type="co_mentioned", strength=0.6)
 
+
+def apply_identity_and_soul_rules(fact_text: str, tag: str, tenant_id: str) -> None:
+    text = fact_text.strip()
+    if not text:
+        return
+
+    # Stabile Fakten (langfristig konsistent)
+    if tag in {"identity", "preference"} or re.search(r"\b(mein name ist|ich heiße|my name is)\b", text, re.IGNORECASE):
+        engine.set_identity(tenant_id=tenant_id, category="facts", content=text[:280], stability="stable")
+
+    # Dynamisches Self-Image (stil-/zustandsnah, veränderbar)
+    if tag in {"style", "llm"} or re.search(r"\b(antworte|ton|stil|style|today|heute|aktuell)\b", text, re.IGNORECASE):
+        engine.set_identity(tenant_id=tenant_id, category="self_image", content=text[:280], stability="dynamic")
+
+    for pattern, category in SOUL_PATTERNS:
+        if pattern.search(text):
+            engine.set_soul(tenant_id=tenant_id, category=category, content=text[:280])
+
 def track_topic_metrics(session_id: str, prompt: str, user_id: str, tenant_id: str) -> None:
     for pattern, tag, _, _ in FACT_PATTERNS:
         if pattern.search(prompt):
@@ -271,6 +295,7 @@ def chat() -> Any:
         )
         engine.record_metric(session_id, "fact_extracted_rule", 1, user_id=user_id, tenant_id=tenant_id)
         update_knowledge_graph_from_fact(fact_text, tenant_id=tenant_id, user_id=user_id)
+        apply_identity_and_soul_rules(fact_text, tag=tag, tenant_id=tenant_id)
         if _has_any(user_prompt, REMEMBER_TRIGGERS):
             engine.record_metric(session_id, "trigger_remember_hit", 1, user_id=user_id, tenant_id=tenant_id)
 
@@ -299,6 +324,7 @@ def chat() -> Any:
         )
         engine.record_metric(session_id, "fact_extracted_llm", 1, user_id=user_id, tenant_id=tenant_id)
         update_knowledge_graph_from_fact(fact_text, tenant_id=tenant_id, user_id=user_id)
+        apply_identity_and_soul_rules(fact_text, tag=str(f.get("tag", "llm")), tenant_id=tenant_id)
 
     exact = engine.get_cached(session_id, user_prompt, user_id=user_id, tenant_id=tenant_id)
     if exact:
