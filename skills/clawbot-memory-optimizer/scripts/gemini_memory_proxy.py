@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -76,7 +77,10 @@ def embed_text(text: str) -> List[float]:
         resp.raise_for_status()
         values = resp.json().get("embedding", {}).get("values", [])
         if isinstance(values, list) and values:
-            return [float(v) for v in values]
+            cleaned = [float(v) for v in values if isinstance(v, (int, float))]
+            if cleaned and all(math.isfinite(v) for v in cleaned):
+                return cleaned
+            logger.warning("Embedding response invalid, fallback used")
     except requests.RequestException as err:
         logger.warning("Embedding endpoint failed, fallback used: %s", err)
     return local_fallback_embedding(text)
@@ -117,24 +121,29 @@ def maybe_extract_fact(user_prompt: str) -> Optional[tuple[str, str, float, str]
 def maybe_generate_summary(session_id: str, user_id: str, tenant_id: str) -> None:
     if not engine.needs_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id):
         return
-    turns = engine.turns_since_last_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id, limit=24)
-    if len(turns) < 8:
+    if not engine.try_acquire_summary_lock(session_id=session_id, user_id=user_id, tenant_id=tenant_id):
         return
-    lines = [f"{r['role']}: {r['content']}" for r in turns]
-    summary_prompt = (
-        "Fasse die folgenden Dialogturns in 4 Stichpunkten zusammen, neutral und kurz.\n"
-        "Falls möglich wichtige stabile Präferenzen benennen.\n\n" + "\n".join(lines)
-    )
-    summary_text = scrub_pii(call_gemini(summary_prompt))
-    engine.create_summary(
-        session_id,
-        summary_text,
-        int(turns[0]["id"]),
-        int(turns[-1]["id"]),
-        user_id=user_id,
-        tenant_id=tenant_id,
-    )
-    engine.record_metric(session_id, "summary_created", 1, user_id=user_id, tenant_id=tenant_id)
+    try:
+        turns = engine.turns_since_last_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id, limit=24)
+        if len(turns) < 8:
+            return
+        lines = [f"{r['role']}: {r['content']}" for r in turns]
+        summary_prompt = (
+            "Fasse die folgenden Dialogturns in 4 Stichpunkten zusammen, neutral und kurz.\n"
+            "Falls möglich wichtige stabile Präferenzen benennen.\n\n" + "\n".join(lines)
+        )
+        summary_text = scrub_pii(call_gemini(summary_prompt))
+        engine.create_summary(
+            session_id,
+            summary_text,
+            int(turns[0]["id"]),
+            int(turns[-1]["id"]),
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        engine.record_metric(session_id, "summary_created", 1, user_id=user_id, tenant_id=tenant_id)
+    finally:
+        engine.release_summary_lock(session_id=session_id, user_id=user_id, tenant_id=tenant_id)
 
 
 def extract_facts_with_llm(text: str) -> list[dict]:
@@ -167,6 +176,7 @@ def chat() -> Any:
     if not user_prompt:
         return jsonify({"error": "prompt fehlt"}), 400
 
+    engine.apply_fact_maintenance()
     track_topic_metrics(session_id, user_prompt, user_id, tenant_id)
     turn_id = engine.remember_turn(session_id, "user", user_prompt, user_id=user_id, tenant_id=tenant_id)
 

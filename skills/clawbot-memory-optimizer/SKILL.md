@@ -16,3 +16,6 @@ description: "Installierbarer Skill für ClawBot mit RAM-sparendem SQLite-Memory
 9. Plane Cleanup: `python scripts/memory_engine.py --purge-cache`.
 10. Nutze Logging/Retry für robusten Betrieb bei transienten DB/API-Fehlern.
 11. Nutze `memory_scope` in Facts (`session|user|tenant`) für Cross-Session-Erinnerung pro Nutzer.
+
+12. Nutze den race-sicheren Summarizer-Lock (`summary_locks`) bei parallelen Requests.
+13. Nutze aktive Cross-Session-Context-Blöcke (letzte Session + Tenant-Trends) für besseres Recall.
