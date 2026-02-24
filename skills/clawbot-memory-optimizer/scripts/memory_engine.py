@@ -84,6 +84,7 @@ class MemoryEngine:
                     continue
                 logger.error("DB error: %s", err)
                 raise
+        raise RuntimeError("DB execution failed after retries")
 
     def _ensure_column(self, table: str, column_def: str, column_name: str) -> None:
         allowed_tables = {
@@ -1172,15 +1173,15 @@ class MemoryEngine:
         )
         if not ok:
             self._exec(
-                "UPDATE memory_proposals SET status = 'rejected', reviewed_by = NULL, review_comment = NULL, approved_at = NULL, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND status = 'approved'",
-                ("execution_failed", now, now, proposal_id, tenant_id),
+                "UPDATE memory_proposals SET status = 'rejected', reviewed_by = NULL, review_comment = NULL, approved_at = NULL, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND status = 'approved' AND reviewed_by = ?",
+                ("execution_failed", now, now, proposal_id, tenant_id, reviewer_agent),
                 commit=True,
             )
             self._log_audit(tenant_id, f"agent:{reviewer_agent}", "proposal_reject", str(row["target_store"]), proposal_id, {"original_agent": str(row["agent_name"]), "proposal_type": str(row["proposal_type"]), "reason": "execution_failed"})
             return False
         self._exec(
-            "UPDATE memory_proposals SET status = 'executed', executed_at = ?, updated_at = ? WHERE id = ? AND status = 'approved'",
-            (now, now, proposal_id),
+            "UPDATE memory_proposals SET status = 'executed', executed_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND status = 'approved' AND reviewed_by = ?",
+            (now, now, proposal_id, tenant_id, reviewer_agent),
             commit=True,
         )
         self._log_audit(tenant_id, f"agent:{reviewer_agent}", "proposal_approve", str(row["target_store"]), proposal_id, {"original_agent": str(row["agent_name"]), "proposal_type": str(row["proposal_type"])})

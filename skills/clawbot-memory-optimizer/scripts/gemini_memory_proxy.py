@@ -105,7 +105,7 @@ def _parse_llm_json(raw: str) -> Any:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"(\[.*\]|\{.*\})", text, re.DOTALL)
+        match = re.search(r"(\[.*?\]|\{.*?\})", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(1))
@@ -191,6 +191,11 @@ def maybe_extract_fact(user_prompt: str) -> Optional[tuple[str, str, float, str]
 
 def maybe_generate_summary(session_id: str, user_id: str, tenant_id: str) -> None:
     scope = (tenant_id, user_id, session_id)
+    if SUMMARY_RETRY_AFTER:
+        now = time.time()
+        stale = [k for k, ts in SUMMARY_RETRY_AFTER.items() if ts <= now]
+        for k in stale:
+            SUMMARY_RETRY_AFTER.pop(k, None)
     retry_after = SUMMARY_RETRY_AFTER.get(scope, 0.0)
     if retry_after > time.time():
         return
@@ -405,6 +410,9 @@ def chat() -> Any:
     turn_id = engine.remember_turn(session_id, "user", user_prompt, user_id=user_id, tenant_id=tenant_id)
 
     rule_fact = maybe_extract_fact(user_prompt)
+    if not rule_fact and _has_any(user_prompt, REMEMBER_TRIGGERS):
+        # Fallback: remember-trigger without rule-pattern still stores a conservative user-scoped fact.
+        rule_fact = (user_prompt[:400], "remember", 0.7, "user")
     if rule_fact:
         fact_text, tag, confidence, scope = rule_fact
         engine.remember_fact(
