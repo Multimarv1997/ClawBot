@@ -32,7 +32,7 @@ PII_PATTERNS = [
     (re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b"), "[IBAN]"),
     (re.compile(r"\b(?:\d{4}[- ]?){3}\d{4}\b"), "[CARD]"),
     (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
-    (re.compile(r"\b\+?\d[\d\s\-/()]{6,}\d\b"), "[PHONE]"),
+    (re.compile(r"(?<!\w)\+?\d[\d\s\-/()]{8,}\d\b"), "[PHONE]"),
 ]
 
 FACT_PATTERNS = [
@@ -107,8 +107,23 @@ def _parse_llm_json(raw: str) -> Any:
         if start < 0:
             return None
         depth = 0
+        in_string = False
+        escaped = False
         for i in range(start, len(s)):
             ch = s[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                    continue
+                if ch == "\\":
+                    escaped = True
+                    continue
+                if ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
             if ch == open_ch:
                 depth += 1
             elif ch == close_ch:
@@ -120,7 +135,7 @@ def _parse_llm_json(raw: str) -> Any:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        for candidate in (_extract_balanced(text, "{", "}"), _extract_balanced(text, "[", "]")):
+        for candidate in (_extract_balanced(text, "[", "]"), _extract_balanced(text, "{", "}")):
             if candidate:
                 try:
                     return json.loads(candidate)
