@@ -884,6 +884,73 @@ class MemoryEngine:
             "created_at": int(row["created_at"]),
         }
 
+    def approve_reflection(self, reflection_id: int, tenant_id: str, user_id: str, approved_tokens: Optional[int] = None, custom_elements: Optional[List[str]] = None) -> bool:
+        now = int(time.time())
+        tokens = int(approved_tokens if approved_tokens is not None else self.config.reflection_baseline_tokens)
+        tokens = max(256, min(tokens, self.config.reflection_max_tokens))
+        if custom_elements is None:
+            custom_elements = ["highlights", "insights", "learnings", "questions", "next_steps"]
+        self._exec(
+            "UPDATE reflection_queue SET status = 'approved', approved_at = ?, updated_at = ?, tokens_used = ?, elements_used = ? WHERE id = ? AND tenant_id = ? AND user_id = ? AND status = 'pending'",
+            (now, now, tokens, json.dumps(custom_elements, ensure_ascii=False), reflection_id, tenant_id, user_id),
+            commit=True,
+        )
+        ok = (self._exec("SELECT changes() AS c").fetchone()["c"] or 0) > 0
+        if ok:
+            self._log_audit(tenant_id, user_id, "reflection_approve", "reflection_queue", reflection_id, {"approved_tokens": tokens, "elements": custom_elements})
+        return bool(ok)
+
+    def reject_reflection(self, reflection_id: int, tenant_id: str, user_id: str, rejection_reason: str = "") -> bool:
+        now = int(time.time())
+        self._exec(
+            "UPDATE reflection_queue SET status = 'rejected', rejected_at = ?, updated_at = ?, rejection_reason = ? WHERE id = ? AND tenant_id = ? AND user_id = ? AND status IN ('pending','approved')",
+            (now, now, rejection_reason[:240], reflection_id, tenant_id, user_id),
+            commit=True,
+        )
+        ok = (self._exec("SELECT changes() AS c").fetchone()["c"] or 0) > 0
+        if ok:
+            self._log_audit(tenant_id, user_id, "reflection_reject", "reflection_queue", reflection_id, {"reason": rejection_reason[:240]})
+        return bool(ok)
+
+    def execute_reflection(self, reflection_id: int, tenant_id: str, user_id: str, reflection_text: str) -> bool:
+        row = self._exec(
+            "SELECT tokens_used, elements_used FROM reflection_queue WHERE id = ? AND tenant_id = ? AND user_id = ? AND status = 'approved'",
+            (reflection_id, tenant_id, user_id),
+        ).fetchone()
+        if not row:
+            return False
+        now = int(time.time())
+        tokens_used = int(row["tokens_used"] or self.config.reflection_baseline_tokens)
+        elements = row["elements_used"] or "[]"
+        self._exec(
+            "INSERT INTO reflection_log(tenant_id, user_id, reflection_text, elements_used, tokens_used, memory_insights, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tenant_id, user_id, reflection_text[:4000], elements, tokens_used, None, now),
+            commit=True,
+        )
+        self._exec(
+            "UPDATE reflection_queue SET status = 'executed', executed_at = ?, updated_at = ?, reflection_text = ? WHERE id = ? AND tenant_id = ? AND user_id = ? AND status = 'approved'",
+            (now, now, reflection_text[:4000], reflection_id, tenant_id, user_id),
+            commit=True,
+        )
+        self._log_audit(tenant_id, user_id, "reflection_execute", "reflection_queue", reflection_id, {"tokens_used": tokens_used})
+        return True
+
+    def get_reflection_history(self, tenant_id: str, user_id: str, limit: int = 10) -> List[dict]:
+        rows = self._exec(
+            "SELECT id, reflection_text, elements_used, tokens_used, created_at FROM reflection_log WHERE tenant_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT ?",
+            (tenant_id, user_id, limit),
+        ).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": int(r["id"]),
+                "reflection_text": str(r["reflection_text"]),
+                "elements_used": json.loads(r["elements_used"]) if r["elements_used"] else [],
+                "tokens_used": int(r["tokens_used"] or 0),
+                "created_at": int(r["created_at"]),
+            })
+        return out
+
     @staticmethod
     def _hash_prompt(prompt: str) -> str:
         return hashlib.sha256(prompt.strip().encode("utf-8")).hexdigest()

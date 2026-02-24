@@ -33,3 +33,13 @@
 3. **Vorbereitung für D2/D3/D4**
    - Status-Modelle (`pending/approved/rejected/executed`) sind vorbereitet
    - API-/Workflow-Layer folgt in nächsten Phasen
+
+
+## Phase D2 (umgesetzt)
+1. **Reflection Queue MVP aktiv**
+   - Trigger-Erkennung (`explicit|soft|scheduled`)
+   - Lifecycle: `pending -> approved/rejected -> executed`
+2. **Reflection API verfügbar**
+   - request/approve/reject/execute/pending/history
+3. **Vorbereitung für D3/D4**
+   - Proposal-Tabellen und Audit-Basis aus D1 bleiben unverändert und bereit

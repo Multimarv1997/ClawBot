@@ -52,6 +52,16 @@ REMEMBER_TRIGGERS = ["remember", "don't forget", "keep in mind", "note that", "s
 FORGET_TRIGGERS = ["forget", "never mind", "disregard", "remove from memory", "vergiss", "streichen", "egal"]
 REFLECT_TRIGGERS = ["reflect", "review memory", "consolidate", "reflektiere", "gedächtnis prüfen"]
 
+REFLECTION_EXPLICIT_TRIGGERS = [
+    "reflect", "let's reflect", "reflektiere", "consolidate memories", "überprüfe mein gedächtnis", "self-review", "selbstreflexion"
+]
+REFLECTION_SOFT_TRIGGERS = [
+    "going to sleep", "logging off", "shutting down", "mache mal pause", "bis später", "schlafe jetzt"
+]
+REFLECTION_SCHEDULED_TRIGGERS = [
+    "daily reflection", "weekly review", "nightly reflection"
+]
+
 SOUL_PATTERNS = [
     (re.compile(r"\b(wert|werte|value|values)\b", re.IGNORECASE), "values"),
     (re.compile(r"\b(prinzip|prinzipien|principle|principles)\b", re.IGNORECASE), "principles"),
@@ -66,6 +76,7 @@ def _has_any(text: str, patterns: list[str]) -> bool:
 app = Flask(__name__)
 engine = MemoryEngine()
 engine.init_db()
+reflection_handler = ReflectionTriggerHandler(engine)
 
 
 def get_api_key() -> str:
@@ -247,6 +258,42 @@ def apply_identity_and_soul_rules(fact_text: str, tag: str, tenant_id: str) -> N
         if pattern.search(text):
             engine.set_soul(tenant_id=tenant_id, category=category, content=text[:280])
 
+
+
+class ReflectionTriggerHandler:
+    def __init__(self, memory_engine: MemoryEngine):
+        self.engine = memory_engine
+
+    def detect_trigger(self, user_input: str) -> Optional[str]:
+        t = user_input.lower()
+        if any(x in t for x in REFLECTION_EXPLICIT_TRIGGERS):
+            return "explicit"
+        if any(x in t for x in REFLECTION_SOFT_TRIGGERS):
+            return "soft"
+        if any(x in t for x in REFLECTION_SCHEDULED_TRIGGERS):
+            return "scheduled"
+        return None
+
+    def handle(self, user_input: str, tenant_id: str, user_id: str) -> Optional[dict]:
+        trigger = self.detect_trigger(user_input)
+        if not trigger:
+            return None
+        if trigger == "soft":
+            return {"action": "prompt_approval", "trigger_type": "soft", "message": "Soll ich vor dem Beenden eine kurze Reflexion anfordern?"}
+        rid = self.engine.request_reflection(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            trigger_type=trigger,
+            token_reason=f"{trigger} trigger",
+        )
+        return {
+            "action": "request_approval",
+            "trigger_type": trigger,
+            "request_id": rid,
+            "message": "Reflexion angefragt. Bitte genehmigen oder ablehnen.",
+        }
+
+
 def track_topic_metrics(session_id: str, prompt: str, user_id: str, tenant_id: str) -> None:
     for pattern, tag, _, _ in FACT_PATTERNS:
         if pattern.search(prompt):
@@ -269,11 +316,17 @@ def chat() -> Any:
         engine.record_metric(session_id, "trigger_forget_hit", 1, user_id=user_id, tenant_id=tenant_id)
         return jsonify({"response": f"Ich habe {deleted} passende Erinnerungen entfernt.", "source": "trigger_forget", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
 
-    if _has_any(user_prompt, REFLECT_TRIGGERS):
-        maybe_generate_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id)
+    reflection_signal = reflection_handler.handle(user_prompt, tenant_id=tenant_id, user_id=user_id)
+    if reflection_signal:
         engine.record_metric(session_id, "trigger_reflect_hit", 1, user_id=user_id, tenant_id=tenant_id)
-        latest = engine.latest_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id) or "Noch keine Zusammenfassung vorhanden."
-        return jsonify({"response": latest, "source": "trigger_reflect", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
+        return jsonify({
+            "response": reflection_signal["message"],
+            "source": "trigger_reflect",
+            "session_id": session_id,
+            "user_id": user_id,
+            "tenant_id": tenant_id,
+            "reflection": reflection_signal,
+        })
 
     engine.apply_fact_maintenance()
     track_topic_metrics(session_id, user_prompt, user_id, tenant_id)
@@ -352,6 +405,71 @@ def chat() -> Any:
     engine.record_metric(session_id, "cache_miss", 1, user_id=user_id, tenant_id=tenant_id)
     engine.record_metric(session_id, "request_latency_ms", (time.perf_counter() - start) * 1000, user_id=user_id, tenant_id=tenant_id)
     return jsonify({"response": answer, "source": "gemini", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
+
+
+@app.post("/api/reflection/request")
+def api_reflection_request() -> Any:
+    body = request.get_json(force=True)
+    tenant_id = str(body.get("tenant_id", "default"))
+    user_id = str(body.get("user_id", "anonymous"))
+    trigger_type = str(body.get("trigger_type", "explicit"))
+    token_reason = str(body.get("token_reason", ""))
+    priority = int(body.get("priority", 1))
+    rid = engine.request_reflection(tenant_id=tenant_id, user_id=user_id, trigger_type=trigger_type, token_reason=token_reason, priority=priority)
+    return jsonify({"status": "pending", "request_id": rid})
+
+
+@app.post("/api/reflection/approve")
+def api_reflection_approve() -> Any:
+    body = request.get_json(force=True)
+    ok = engine.approve_reflection(
+        reflection_id=int(body.get("reflection_id", 0)),
+        tenant_id=str(body.get("tenant_id", "default")),
+        user_id=str(body.get("user_id", "anonymous")),
+        approved_tokens=body.get("approved_tokens"),
+        custom_elements=body.get("custom_elements"),
+    )
+    return (jsonify({"status": "approved"}), 200) if ok else (jsonify({"error": "approve failed"}), 400)
+
+
+@app.post("/api/reflection/reject")
+def api_reflection_reject() -> Any:
+    body = request.get_json(force=True)
+    ok = engine.reject_reflection(
+        reflection_id=int(body.get("reflection_id", 0)),
+        tenant_id=str(body.get("tenant_id", "default")),
+        user_id=str(body.get("user_id", "anonymous")),
+        rejection_reason=str(body.get("rejection_reason", "")),
+    )
+    return (jsonify({"status": "rejected"}), 200) if ok else (jsonify({"error": "reject failed"}), 400)
+
+
+@app.post("/api/reflection/execute")
+def api_reflection_execute() -> Any:
+    body = request.get_json(force=True)
+    ok = engine.execute_reflection(
+        reflection_id=int(body.get("reflection_id", 0)),
+        tenant_id=str(body.get("tenant_id", "default")),
+        user_id=str(body.get("user_id", "anonymous")),
+        reflection_text=str(body.get("reflection_text", "")),
+    )
+    return (jsonify({"status": "executed"}), 200) if ok else (jsonify({"error": "execute failed"}), 400)
+
+
+@app.get("/api/reflection/pending")
+def api_reflection_pending() -> Any:
+    tenant_id = str(request.args.get("tenant_id", "default"))
+    user_id = str(request.args.get("user_id", "anonymous"))
+    item = engine.get_pending_reflection(tenant_id=tenant_id, user_id=user_id)
+    return jsonify({"pending": item})
+
+
+@app.get("/api/reflection/history")
+def api_reflection_history() -> Any:
+    tenant_id = str(request.args.get("tenant_id", "default"))
+    user_id = str(request.args.get("user_id", "anonymous"))
+    limit = int(request.args.get("limit", "10"))
+    return jsonify({"items": engine.get_reflection_history(tenant_id=tenant_id, user_id=user_id, limit=limit)})
 
 
 @app.get("/metrics")

@@ -30,3 +30,6 @@ description: "Installierbarer Skill für ClawBot mit RAM-sparendem SQLite-Memory
 
 20. Starte Phase D1 nur als Foundation: neue Queue/Proposal/Audit-Tabellen + Basis-Methoden.
 21. Verschiebe Trigger-Handler/Approval-Endpunkte bewusst in D2/D3/D4.
+
+22. Setze D2 um: Reflection Queue MVP (Trigger + approve/reject/execute + history + Reflection-API).
+23. Belasse Multi-Agent-Proposals (D3) und erweiterte Governance/Analytics (D4) weiterhin als nächste Schritte.

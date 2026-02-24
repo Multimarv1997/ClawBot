@@ -40,6 +40,14 @@ def main() -> None:
     print("Semantic Hit:", engine.get_semantic_cached(session, p2, toy_embedder, threshold=0.6, user_id=user, tenant_id=tenant))
     print("Context:\n", engine.build_context(session, query="antwort", user_id=user, tenant_id=tenant))
 
+    print("\nReflection Queue Demo:")
+    rid = engine.request_reflection(tenant_id=tenant, user_id=user, trigger_type="explicit", token_reason="demo")
+    print("Requested:", rid)
+    print("Pending:", engine.get_pending_reflection(tenant_id=tenant, user_id=user))
+    print("Approved:", engine.approve_reflection(rid, tenant_id=tenant, user_id=user, approved_tokens=1200))
+    print("Executed:", engine.execute_reflection(rid, tenant_id=tenant, user_id=user, reflection_text="Kurze Reflexion: Nutzer möchte kurze Antworten."))
+    print("History:", engine.get_reflection_history(tenant_id=tenant, user_id=user, limit=3))
+
 
 if __name__ == "__main__":
     main()
