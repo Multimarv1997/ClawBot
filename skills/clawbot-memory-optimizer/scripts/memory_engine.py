@@ -434,6 +434,27 @@ class MemoryEngine:
     def normalize_fact_key(text: str) -> str:
         return re.sub(r"\s+", " ", re.sub(r"[^\w\säöüÄÖÜß]", "", text.lower())).strip()
 
+    @staticmethod
+    def _negation_patterns() -> list[re.Pattern[str]]:
+        return [
+            re.compile(r"\bnicht\b", re.IGNORECASE),
+            re.compile(r"\bnot\b", re.IGNORECASE),
+            re.compile(r"\bnever\b", re.IGNORECASE),
+            re.compile(r"\bkein(?:e|er|em|en)?\b", re.IGNORECASE),
+            re.compile(r"\bno\b", re.IGNORECASE),
+        ]
+
+    @classmethod
+    def contains_negation(cls, text: str) -> bool:
+        return any(p.search(text) for p in cls._negation_patterns())
+
+    @classmethod
+    def normalize_fact_key_without_negation(cls, text: str) -> str:
+        cleaned = text
+        for p in cls._negation_patterns():
+            cleaned = p.sub(" ", cleaned)
+        return cls.normalize_fact_key(cleaned)
+
     def _relevance(self, base: float, last_accessed: int, access_count: int, memory_type: str) -> float:
         if memory_type == "vault":
             return 1.0
@@ -514,8 +535,10 @@ class MemoryEngine:
     def remember_fact(self, session_id: str, fact: str, tag: str = "general", priority: int = 1, confidence: float = 1.0, source_turn_id: Optional[int] = None, expires_at: Optional[int] = None, memory_scope: str = "session", memory_type: str = "semantic", user_id: str = "anonymous", tenant_id: str = "default") -> None:
         now = int(time.time())
         fact_key = self.normalize_fact_key(fact)
+        normalized_no_neg = self.normalize_fact_key_without_negation(fact)
+        new_neg = self.contains_negation(fact.lower())
         existing = self._exec(
-            "SELECT id, confidence, priority, hit_count, fact, relevance_score FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND memory_scope = ? AND fact_key = ? LIMIT 1",
+            "SELECT id, confidence, priority, hit_count, fact, relevance_score, conflict_group FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND memory_scope = ? AND fact_key = ? LIMIT 1",
             (tenant_id, user_id, session_id, memory_scope, fact_key),
         ).fetchone()
 
@@ -525,18 +548,9 @@ class MemoryEngine:
             new_rel = max(float(existing["relevance_score"]), 0.6)
             conflict_group = None
             old_fact = str(existing["fact"]).lower()
-            new_fact = fact.lower()
-            neg_patterns = [
-                re.compile(r"\bnicht\b", re.IGNORECASE),
-                re.compile(r"\bnot\b", re.IGNORECASE),
-                re.compile(r"\bnever\b", re.IGNORECASE),
-                re.compile(r"\bkein(?:e|er|em|en)?\b", re.IGNORECASE),
-                re.compile(r"\bno\b", re.IGNORECASE),
-            ]
-            old_neg = any(p.search(old_fact) for p in neg_patterns)
-            new_neg = any(p.search(new_fact) for p in neg_patterns)
+            old_neg = self.contains_negation(old_fact)
             if old_neg != new_neg:
-                conflict_group = fact_key
+                conflict_group = str(existing["conflict_group"] or normalized_no_neg or fact_key)
             self._exec(
                 "UPDATE facts SET fact = ?, tag = ?, confidence = ?, priority = ?, hit_count = hit_count + 1, relevance_score = ?, relevance_base = MAX(COALESCE(relevance_base, 1.0), ?), memory_status = ?, source_turn_id = COALESCE(?, source_turn_id), expires_at = COALESCE(?, expires_at), conflict_group = COALESCE(?, conflict_group), updated_at = ?, last_accessed_at = ? WHERE id = ?",
                 (fact, tag, new_conf, new_prio, new_rel, float(confidence), self._status(new_rel), source_turn_id, expires_at, conflict_group, now, now, int(existing["id"])),
@@ -544,9 +558,28 @@ class MemoryEngine:
             )
             return
 
+        conflict_group = None
+        if normalized_no_neg:
+            candidates = self._exec(
+                "SELECT id, fact, conflict_group FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND memory_scope = ?",
+                (tenant_id, user_id, session_id, memory_scope),
+            ).fetchall()
+            for row in candidates:
+                candidate_fact = str(row["fact"])
+                if self.normalize_fact_key_without_negation(candidate_fact) != normalized_no_neg:
+                    continue
+                if self.contains_negation(candidate_fact.lower()) == new_neg:
+                    continue
+                conflict_group = str(row["conflict_group"] or normalized_no_neg)
+                self._exec(
+                    "UPDATE facts SET conflict_group = COALESCE(conflict_group, ?) WHERE id = ?",
+                    (conflict_group, int(row["id"])),
+                    commit=True,
+                )
+
         self._exec(
             "INSERT INTO facts(session_id, user_id, tenant_id, memory_scope, memory_type, memory_status, relevance_score, relevance_base, fact_key, fact, tag, confidence, source_turn_id, expires_at, priority, hit_count, conflict_group, created_at, updated_at, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, user_id, tenant_id, memory_scope, memory_type, "active", 1.0, 1.0, fact_key, fact, tag, confidence, source_turn_id, expires_at, priority, 0, None, now, now, now),
+            (session_id, user_id, tenant_id, memory_scope, memory_type, "active", 1.0, 1.0, fact_key, fact, tag, confidence, source_turn_id, expires_at, priority, 0, conflict_group, now, now, now),
             commit=True,
         )
 
