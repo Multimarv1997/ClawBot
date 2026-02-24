@@ -15,3 +15,9 @@ Installierbarer Skill für ClawBot mit disk-first Memory, exact/semantic cache, 
 ## API
 - `POST /chat` mit `{ "tenant_id":"acme", "user_id":"alice", "session_id":"s1", "prompt":"..." }`
 - `GET /metrics?tenant_id=acme&user_id=alice&session_id=s1`
+
+
+## Phase D1 gestartet (Foundation)
+- Neue Tabellen/Indizes: `reflection_queue`, `reflection_log`, `agents`, `memory_proposals`, `audit_log`
+- Basis-Methoden für Queue/Audit: `request_reflection`, `get_pending_reflection`, `get_audit_log`, Cleanup-Helfer
+- D2/D3/D4 vorbereitet durch Status- und Governance-Struktur (noch ohne API-Workflow)

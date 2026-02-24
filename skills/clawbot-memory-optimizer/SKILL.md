@@ -27,3 +27,6 @@ description: "Installierbarer Skill für ClawBot mit RAM-sparendem SQLite-Memory
 17. Aktiviere Phase B: Entity-Extraktion (Regel + optional LLM) und Graph-Recall über `entities`/`relations`.
 18. Nutze Phase C aktiv: `identity` (stabil + dynamisch) und `soul` für Werte/Prinzipien im Kontext.
 19. Erzwinge striktes Kontextbudget mit globalem Token-Limit plus Block-Budgets pro Speicherquelle.
+
+20. Starte Phase D1 nur als Foundation: neue Queue/Proposal/Audit-Tabellen + Basis-Methoden.
+21. Verschiebe Trigger-Handler/Approval-Endpunkte bewusst in D2/D3/D4.

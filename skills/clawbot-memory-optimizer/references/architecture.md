@@ -22,3 +22,14 @@
 
 ## Kontextpipeline
 `identity -> soul -> summary -> top facts -> previous-session facts -> tenant trends -> graph entities/relations -> recent turns`
+
+
+## Phase D1 (umgesetzt)
+1. **Foundation-Schema erweitert**
+   - `reflection_queue`, `reflection_log`, `agents`, `memory_proposals`, `audit_log` inkl. Indizes
+2. **Governance-Basis**
+   - Reflection-Request-Basics und Pending-Abfrage
+   - Audit-Logging + Retention/Cleanup-Helfer
+3. **Vorbereitung für D2/D3/D4**
+   - Status-Modelle (`pending/approved/rejected/executed`) sind vorbereitet
+   - API-/Workflow-Layer folgt in nächsten Phasen

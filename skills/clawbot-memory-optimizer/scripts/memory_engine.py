@@ -40,6 +40,17 @@ class MemoryConfig:
     context_block_budget_graph_entities: int = 60
     context_block_budget_graph_relations: int = 60
     context_block_budget_recent_turns: int = 160
+    # Phase D1
+    reflection_baseline_tokens: int = 8000
+    reflection_max_tokens: int = 16000
+    reflection_elements_min: int = 5
+    reflection_elements_max: int = 8
+    reflection_log_limit: int = 10
+    reflection_auto_approve_threshold: float = 0.9
+    max_pending_proposals: int = 50
+    proposal_auto_expire_hours: int = 24
+    proposal_review_timeout_minutes: int = 30
+    audit_retention_days: int = 90
 
 
 TYPE_WEIGHTS = {
@@ -288,6 +299,116 @@ class MemoryEngine:
             commit=True,
         )
         self._exec("CREATE INDEX IF NOT EXISTS idx_soul_tenant_category_time ON soul(tenant_id, category, updated_at DESC)", commit=True)
+
+        # Phase D1: Reflection Queue
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS reflection_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                trigger_type TEXT NOT NULL DEFAULT 'explicit',
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority INTEGER DEFAULT 1,
+                tokens_requested INTEGER DEFAULT 8000,
+                token_reason TEXT,
+                content_preview TEXT,
+                reflection_text TEXT,
+                elements_used TEXT,
+                tokens_used INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                approved_at INTEGER,
+                executed_at INTEGER,
+                rejected_at INTEGER,
+                rejection_reason TEXT
+            )
+            """,
+            commit=True,
+        )
+        self._exec("CREATE INDEX IF NOT EXISTS idx_reflection_queue_status_time ON reflection_queue(tenant_id, user_id, status, created_at DESC)", commit=True)
+
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS reflection_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                reflection_text TEXT NOT NULL,
+                elements_used TEXT,
+                tokens_used INTEGER,
+                memory_insights TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """,
+            commit=True,
+        )
+        self._exec("CREATE INDEX IF NOT EXISTS idx_reflection_log_tenant_time ON reflection_log(tenant_id, user_id, created_at DESC)", commit=True)
+
+        # Phase D1: Multi-Agent proposals (schema only)
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS agents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                agent_type TEXT NOT NULL DEFAULT 'subagent',
+                permissions TEXT NOT NULL DEFAULT 'read',
+                active INTEGER DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                last_active_at INTEGER,
+                UNIQUE(tenant_id, agent_name)
+            )
+            """,
+            commit=True,
+        )
+        self._exec("CREATE INDEX IF NOT EXISTS idx_agents_tenant_name ON agents(tenant_id, agent_name)", commit=True)
+
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS memory_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                target_store TEXT NOT NULL,
+                proposal_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                confidence TEXT DEFAULT 'medium',
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority INTEGER DEFAULT 1,
+                reviewed_by TEXT,
+                review_comment TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                approved_at INTEGER,
+                rejected_at INTEGER,
+                rejection_reason TEXT,
+                executed_at INTEGER
+            )
+            """,
+            commit=True,
+        )
+        self._exec("CREATE INDEX IF NOT EXISTS idx_memory_proposals_status_time ON memory_proposals(tenant_id, status, created_at DESC)", commit=True)
+
+        # Phase D1: Audit log
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                actor_type TEXT NOT NULL,
+                actor_name TEXT,
+                action_type TEXT NOT NULL,
+                target_store TEXT,
+                target_id INTEGER,
+                details TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """,
+            commit=True,
+        )
+        self._exec("CREATE INDEX IF NOT EXISTS idx_audit_log_tenant_time ON audit_log(tenant_id, created_at DESC)", commit=True)
 
     def _scope(self, session_id: str, user_id: str, tenant_id: str) -> tuple[str, str, str]:
         return tenant_id, user_id, session_id
@@ -665,6 +786,103 @@ class MemoryEngine:
         ).fetchall()
         rendered = [f"{r['category']}: {r['content']}" for r in rows]
         return [line[2:] if line.startswith("- ") else line for line in self._fit_lines_to_budget(rendered, max_tokens=max_tokens)]
+
+    def _log_audit(self, tenant_id: str, user_id: str, action_type: str, target_store: str, target_id: Optional[int], details: dict) -> None:
+        now = int(time.time())
+        actor_type = "user"
+        actor_name = user_id
+        if user_id in {"system", "reflection_queue", "memory_proposals"}:
+            actor_type = "system"
+        elif user_id.startswith("agent:"):
+            actor_type = "subagent"
+            actor_name = user_id.replace("agent:", "", 1)
+        self._exec(
+            "INSERT INTO audit_log(tenant_id, user_id, actor_type, actor_name, action_type, target_store, target_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (tenant_id, user_id, actor_type, actor_name, action_type, target_store, target_id, json.dumps(details, ensure_ascii=False), now),
+            commit=True,
+        )
+
+    def get_audit_log(self, tenant_id: str, action_type: Optional[str] = None, target_store: Optional[str] = None, limit: int = 100) -> List[dict]:
+        query = "SELECT id, actor_type, actor_name, action_type, target_store, target_id, details, created_at FROM audit_log WHERE tenant_id = ?"
+        params: list = [tenant_id]
+        if action_type:
+            query += " AND action_type = ?"
+            params.append(action_type)
+        if target_store:
+            query += " AND target_store = ?"
+            params.append(target_store)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self._exec(query, tuple(params)).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": int(r["id"]),
+                "actor_type": str(r["actor_type"]),
+                "actor_name": str(r["actor_name"]) if r["actor_name"] else "",
+                "action_type": str(r["action_type"]),
+                "target_store": str(r["target_store"]) if r["target_store"] else "",
+                "target_id": int(r["target_id"]) if r["target_id"] is not None else None,
+                "details": json.loads(r["details"]) if r["details"] else {},
+                "created_at": int(r["created_at"]),
+            })
+        return out
+
+    def cleanup_old_audit_logs(self, retention_days: Optional[int] = None) -> int:
+        days = retention_days if retention_days is not None else self.config.audit_retention_days
+        cutoff = int(time.time()) - days * 24 * 3600
+        deleted = self._exec("DELETE FROM audit_log WHERE created_at < ?", (cutoff,), commit=True).rowcount or 0
+        return int(deleted)
+
+    def cleanup_stale_phase_d_state(self) -> dict:
+        now = int(time.time())
+        proposal_cutoff = now - self.config.proposal_auto_expire_hours * 3600
+        expired_proposals = self._exec(
+            "UPDATE memory_proposals SET status = 'rejected', rejection_reason = COALESCE(rejection_reason, 'auto_expired'), rejected_at = ?, updated_at = ? WHERE status = 'pending' AND created_at < ?",
+            (now, now, proposal_cutoff),
+            commit=True,
+        ).rowcount or 0
+        old_reflections = self._exec(
+            "DELETE FROM reflection_queue WHERE status IN ('executed', 'rejected') AND updated_at < ?",
+            (proposal_cutoff,),
+            commit=True,
+        ).rowcount or 0
+        return {"expired_proposals": int(expired_proposals), "deleted_reflection_queue_rows": int(old_reflections)}
+
+    def request_reflection(self, tenant_id: str, user_id: str, trigger_type: str = "explicit", token_reason: str = "", priority: int = 1) -> int:
+        now = int(time.time())
+        existing = self._exec(
+            "SELECT id FROM reflection_queue WHERE tenant_id = ? AND user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+            (tenant_id, user_id),
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
+        cur = self._exec(
+            "INSERT INTO reflection_queue(tenant_id, user_id, trigger_type, status, priority, tokens_requested, token_reason, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
+            (tenant_id, user_id, trigger_type, max(1, min(5, int(priority))), self.config.reflection_baseline_tokens, token_reason[:240], now, now),
+            commit=True,
+        )
+        rid = int(cur.lastrowid)
+        self._log_audit(tenant_id, user_id, "reflection_request", "reflection_queue", rid, {"trigger_type": trigger_type, "tokens_requested": self.config.reflection_baseline_tokens})
+        return rid
+
+    def get_pending_reflection(self, tenant_id: str, user_id: str) -> Optional[dict]:
+        row = self._exec(
+            "SELECT id, trigger_type, status, tokens_requested, token_reason, content_preview, priority, created_at FROM reflection_queue WHERE tenant_id = ? AND user_id = ? AND status = 'pending' ORDER BY priority DESC, created_at ASC LIMIT 1",
+            (tenant_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row["id"]),
+            "trigger_type": str(row["trigger_type"]),
+            "status": str(row["status"]),
+            "tokens_requested": int(row["tokens_requested"]),
+            "token_reason": str(row["token_reason"] or ""),
+            "content_preview": str(row["content_preview"] or ""),
+            "priority": int(row["priority"]),
+            "created_at": int(row["created_at"]),
+        }
 
     @staticmethod
     def _hash_prompt(prompt: str) -> str:
