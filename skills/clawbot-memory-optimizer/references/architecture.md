@@ -1,19 +1,18 @@
 # Architektur: zuverlässiges Memory für ClawBot
 
-## Phase 2
-- Summaries in `summaries` bei Trigger (z. B. viele Turns).
-- Fact-Extraktion (Regel + LLM-Hybrid), Speicherung mit `confidence`, `source_turn_id`, `expires_at`.
-- Kontextpipeline: `summary -> top facts -> recent turns`.
+## Fokus dieser Iteration
+1. **Robustheit zuerst**
+   - SQLite-Retry bei `database is locked`
+   - Logging für DB/HTTP/Embedding-Fehler
+   - Validierung von Embedding-Dimensionen
+2. **PII-Filter erweitert**
+   - E-Mail, Telefon, IBAN, Kreditkarte, SSN werden maskiert
+3. **Summary/Fact Qualität**
+   - Summary aus Turns seit letztem Summary (ID-basiert)
+   - Hybrid Fact-Extraction: Regeln + optional LLM-JSON
 
-## Phase 3
-- Scope überall: `tenant_id`, `user_id`, `session_id`.
-- Indizes auf Scope-Felder für Performance.
-- Retention möglich über TTL (`expires_at`) und periodischen Purge.
+## Kontextpipeline
+`summary -> top facts -> recent turns`
 
-## Kern-Tabellen
-- `interactions(tenant_id, user_id, session_id, role, content, created_at)`
-- `facts(..., confidence, source_turn_id, expires_at)`
-- `summaries(session_id, user_id, tenant_id, summary, from_turn_id, to_turn_id)`
-- `exact_cache_entries(tenant_id, user_id, session_id, prompt_hash, ...)`
-- `semantic_cache_entries(tenant_id, user_id, session_id, prompt, embedding_json, ...)`
-- `metrics(tenant_id, user_id, session_id, metric_name, value, created_at)`
+## Scope
+Alle Daten bleiben isoliert über `tenant_id`, `user_id`, `session_id`.

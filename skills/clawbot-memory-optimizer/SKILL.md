@@ -1,6 +1,6 @@
 ---
 name: clawbot-memory-optimizer
-description: "Installierbarer Skill für ClawBot mit RAM-sparendem SQLite-Memory, exact+semantischem Cache, PII-Filter, Metriken, Summarizer, Fact-Extraktion und Multi-Session-Scopes (tenant/user/session)."
+description: "Installierbarer Skill für ClawBot mit RAM-sparendem SQLite-Memory, exact+semantischem Cache, erweitertem PII-Filter, robuster Fehlerbehandlung, Summarizer, Fact-Extraktion und Multi-Session-Scopes (tenant/user/session)."
 ---
 
 # ClawBot Memory Optimizer
@@ -14,3 +14,4 @@ description: "Installierbarer Skill für ClawBot mit RAM-sparendem SQLite-Memory
 7. Nutze Kontextaufbau: summary -> top facts -> recent turns.
 8. Prüfe Metriken mit `GET /metrics?...`.
 9. Plane Cleanup: `python scripts/memory_engine.py --purge-cache`.
+10. Nutze Logging/Retry für robusten Betrieb bei transienten DB/API-Fehlern.

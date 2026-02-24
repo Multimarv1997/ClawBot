@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""HTTP-Proxy mit exact + semantic cache, PII-Filter, Summaries, Fact-Extraktion."""
+"""HTTP-Proxy mit exact + semantic cache, robustem PII-Filter und besserem Summary/Fact Flow."""
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 import time
@@ -14,6 +16,9 @@ from flask import Flask, jsonify, request
 from memory_engine import MemoryEngine
 
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004")
 GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
@@ -23,12 +28,14 @@ PII_PATTERNS = [
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[EMAIL]"),
     (re.compile(r"\+?\d[\d\s\-/()]{6,}\d"), "[PHONE]"),
     (re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b"), "[IBAN]"),
+    (re.compile(r"\b(?:\d{4}[- ]?){3}\d{4}\b"), "[CARD]"),
+    (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
 ]
 
 FACT_PATTERNS = [
-    (re.compile(r"\bich bevorzuge\b", re.IGNORECASE), "preference", 0.8),
-    (re.compile(r"\bmein name ist\b", re.IGNORECASE), "identity", 0.7),
-    (re.compile(r"\bbitte antworte\b", re.IGNORECASE), "style", 0.85),
+    (re.compile(r"\bich bevorzuge\b", re.IGNORECASE), "preference", 0.85),
+    (re.compile(r"\bmein name ist\b", re.IGNORECASE), "identity", 0.70),
+    (re.compile(r"\bbitte antworte\b", re.IGNORECASE), "style", 0.9),
 ]
 
 app = Flask(__name__)
@@ -52,9 +59,7 @@ def local_fallback_embedding(text: str, dim: int = 64) -> List[float]:
     for tok in text.lower().split():
         vec[hash(tok) % dim] += 1.0
     norm = sum(x * x for x in vec) ** 0.5
-    if norm == 0.0:
-        return vec
-    return [x / norm for x in vec]
+    return [x / norm for x in vec] if norm else vec
 
 
 def embed_text(text: str) -> List[float]:
@@ -65,15 +70,15 @@ def embed_text(text: str) -> List[float]:
         resp = requests.post(
             GEMINI_EMBED_ENDPOINT,
             params={"key": api_key},
-            json={"content": {"parts": [{"text": text}]}},
+            json={"content": {"parts": [{"text": text}]}} ,
             timeout=30,
         )
         resp.raise_for_status()
         values = resp.json().get("embedding", {}).get("values", [])
         if isinstance(values, list) and values:
             return [float(v) for v in values]
-    except requests.RequestException:
-        pass
+    except requests.RequestException as err:
+        logger.warning("Embedding endpoint failed, fallback used: %s", err)
     return local_fallback_embedding(text)
 
 
@@ -81,16 +86,21 @@ def call_gemini(prompt: str) -> str:
     api_key = get_api_key()
     if not api_key:
         return "[Demo-Antwort] GEMINI_API_KEY fehlt."
-    resp = requests.post(
-        GEMINI_ENDPOINT,
-        params={"key": api_key},
-        json={"contents": [{"parts": [{"text": prompt}]}]},
-        timeout=30,
-    )
-    resp.raise_for_status()
+    try:
+        resp = requests.post(
+            GEMINI_ENDPOINT,
+            params={"key": api_key},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as err:
+        logger.error("Gemini call failed: %s", err)
+        return "[Fehler] Gemini aktuell nicht erreichbar."
+
     data = resp.json()
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        return str(data["candidates"][0]["content"]["parts"][0]["text"])
     except (KeyError, IndexError, TypeError):
         return str(data)
 
@@ -108,25 +118,33 @@ def maybe_extract_fact(user_prompt: str) -> Optional[tuple[str, str, float]]:
 def maybe_generate_summary(session_id: str, user_id: str, tenant_id: str) -> None:
     if not engine.needs_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id):
         return
-    turns = engine.recent_turns(session_id=session_id, limit=12, user_id=user_id, tenant_id=tenant_id)
-    if not turns:
+    turns = engine.turns_since_last_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id, limit=24)
+    if len(turns) < 8:
         return
-    raw = "\n".join(turns)
-    summary_text = call_gemini(
-        "Fasse die folgenden Dialogturns in 4 Stichpunkten zusammen, neutral und kurz:\n\n" + raw
+
+    lines = [f"{r['role']}: {r['content']}" for r in turns]
+    summary_prompt = (
+        "Fasse die folgenden Dialogturns in 4 Stichpunkten zusammen, neutral und kurz.\n"
+        "Falls möglich wichtige stabile Präferenzen benennen.\n\n" + "\n".join(lines)
     )
-    summary_text = scrub_pii(summary_text)
-    from_turn_id = max(1, 1)
-    to_turn_id = max(1, len(turns))
-    engine.create_summary(
-        session_id=session_id,
-        user_id=user_id,
-        tenant_id=tenant_id,
-        summary=summary_text,
-        from_turn_id=from_turn_id,
-        to_turn_id=to_turn_id,
-    )
+    summary_text = scrub_pii(call_gemini(summary_prompt))
+    from_turn_id = int(turns[0]["id"])
+    to_turn_id = int(turns[-1]["id"])
+    engine.create_summary(session_id, summary_text, from_turn_id, to_turn_id, user_id=user_id, tenant_id=tenant_id)
     engine.record_metric(session_id, "summary_created", 1, user_id=user_id, tenant_id=tenant_id)
+
+
+def extract_facts_with_llm(text: str) -> list[dict]:
+    payload = (
+        "Extrahiere bis zu 3 wichtige Fakten als JSON-Liste mit Feldern fact, tag, confidence (0..1).\n"
+        f"Text:\n{text}"
+    )
+    raw = call_gemini(payload)
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
 
 
 @app.post("/chat")
@@ -141,21 +159,19 @@ def chat() -> Any:
         return jsonify({"error": "prompt fehlt"}), 400
 
     turn_id = engine.remember_turn(session_id, "user", user_prompt, user_id=user_id, tenant_id=tenant_id)
+
     fact = maybe_extract_fact(user_prompt)
     if fact:
         fact_text, tag, confidence = fact
-        expires = int(time.time()) + 60 * 60 * 24 * 30
-        engine.remember_fact(
-            session_id,
-            fact_text,
-            tag=tag,
-            confidence=confidence,
-            source_turn_id=turn_id,
-            expires_at=expires,
-            user_id=user_id,
-            tenant_id=tenant_id,
-        )
+        engine.remember_fact(session_id, fact_text, tag=tag, confidence=confidence, source_turn_id=turn_id, expires_at=int(time.time()) + 30 * 24 * 3600, user_id=user_id, tenant_id=tenant_id)
         engine.record_metric(session_id, "fact_extracted", 1, user_id=user_id, tenant_id=tenant_id)
+
+    llm_facts = extract_facts_with_llm(user_prompt)
+    for f in llm_facts[:3]:
+        fact_text = scrub_pii(str(f.get("fact", "")).strip())
+        if not fact_text:
+            continue
+        engine.remember_fact(session_id, fact_text, tag=str(f.get("tag", "llm")), confidence=float(f.get("confidence", 0.7)), source_turn_id=turn_id, expires_at=int(time.time()) + 30 * 24 * 3600, user_id=user_id, tenant_id=tenant_id)
 
     exact = engine.get_cached(session_id, user_prompt, user_id=user_id, tenant_id=tenant_id)
     if exact:

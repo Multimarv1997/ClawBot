@@ -4,12 +4,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -25,18 +30,30 @@ class MemoryConfig:
 class MemoryEngine:
     def __init__(self, config: Optional[MemoryConfig] = None) -> None:
         self.config = config or MemoryConfig()
-        self.conn = sqlite3.connect(self.config.db_path)
+        self.conn = sqlite3.connect(self.config.db_path, timeout=10)
         self.conn.row_factory = sqlite3.Row
 
+    def _exec(self, sql: str, params: tuple = (), commit: bool = False):
+        for i in range(3):
+            try:
+                cur = self.conn.execute(sql, params)
+                if commit:
+                    self.conn.commit()
+                return cur
+            except sqlite3.OperationalError as err:
+                if "locked" in str(err).lower() and i < 2:
+                    time.sleep(0.05 * (i + 1))
+                    continue
+                logger.error("DB error: %s", err)
+                raise
+
     def _ensure_column(self, table: str, column_def: str, column_name: str) -> None:
-        cols = [r[1] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        cols = [r[1] for r in self._exec(f"PRAGMA table_info({table})").fetchall()]
         if column_name not in cols:
-            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
-            self.conn.commit()
+            self._exec(f"ALTER TABLE {table} ADD COLUMN {column_def}", commit=True)
 
     def init_db(self) -> None:
-        c = self.conn.cursor()
-        c.execute(
+        self._exec(
             """
             CREATE TABLE IF NOT EXISTS interactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,16 +64,15 @@ class MemoryEngine:
                 content TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             )
-            """
+            """,
+            commit=True,
         )
         self._ensure_column("interactions", "session_id TEXT NOT NULL DEFAULT 'default'", "session_id")
         self._ensure_column("interactions", "user_id TEXT NOT NULL DEFAULT 'anonymous'", "user_id")
         self._ensure_column("interactions", "tenant_id TEXT NOT NULL DEFAULT 'default'", "tenant_id")
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_interactions_scope_time ON interactions(tenant_id, user_id, session_id, created_at DESC, id DESC)"
-        )
+        self._exec("CREATE INDEX IF NOT EXISTS idx_interactions_scope_time ON interactions(tenant_id, user_id, session_id, created_at DESC, id DESC)", commit=True)
 
-        c.execute(
+        self._exec(
             """
             CREATE TABLE IF NOT EXISTS facts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,19 +87,21 @@ class MemoryEngine:
                 priority INTEGER DEFAULT 1,
                 created_at INTEGER NOT NULL
             )
-            """
+            """,
+            commit=True,
         )
-        self._ensure_column("facts", "session_id TEXT NOT NULL DEFAULT 'default'", "session_id")
-        self._ensure_column("facts", "user_id TEXT NOT NULL DEFAULT 'anonymous'", "user_id")
-        self._ensure_column("facts", "tenant_id TEXT NOT NULL DEFAULT 'default'", "tenant_id")
-        self._ensure_column("facts", "confidence REAL NOT NULL DEFAULT 1.0", "confidence")
-        self._ensure_column("facts", "source_turn_id INTEGER", "source_turn_id")
-        self._ensure_column("facts", "expires_at INTEGER", "expires_at")
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_facts_scope_priority ON facts(tenant_id, user_id, session_id, priority DESC, created_at DESC)"
-        )
+        for col_def, col_name in [
+            ("session_id TEXT NOT NULL DEFAULT 'default'", "session_id"),
+            ("user_id TEXT NOT NULL DEFAULT 'anonymous'", "user_id"),
+            ("tenant_id TEXT NOT NULL DEFAULT 'default'", "tenant_id"),
+            ("confidence REAL NOT NULL DEFAULT 1.0", "confidence"),
+            ("source_turn_id INTEGER", "source_turn_id"),
+            ("expires_at INTEGER", "expires_at"),
+        ]:
+            self._ensure_column("facts", col_def, col_name)
+        self._exec("CREATE INDEX IF NOT EXISTS idx_facts_scope_priority ON facts(tenant_id, user_id, session_id, priority DESC, created_at DESC)", commit=True)
 
-        c.execute(
+        self._exec(
             """
             CREATE TABLE IF NOT EXISTS summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,13 +113,12 @@ class MemoryEngine:
                 to_turn_id INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             )
-            """
+            """,
+            commit=True,
         )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_summaries_scope_time ON summaries(tenant_id, user_id, session_id, created_at DESC)"
-        )
+        self._exec("CREATE INDEX IF NOT EXISTS idx_summaries_scope_time ON summaries(tenant_id, user_id, session_id, created_at DESC)", commit=True)
 
-        c.execute(
+        self._exec(
             """
             CREATE TABLE IF NOT EXISTS exact_cache_entries (
                 tenant_id TEXT NOT NULL,
@@ -113,13 +130,12 @@ class MemoryEngine:
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (tenant_id, user_id, session_id, prompt_hash)
             )
-            """
+            """,
+            commit=True,
         )
-        self._ensure_column("exact_cache_entries", "tenant_id TEXT NOT NULL DEFAULT 'default'", "tenant_id")
-        self._ensure_column("exact_cache_entries", "user_id TEXT NOT NULL DEFAULT 'anonymous'", "user_id")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_exact_cache_expires ON exact_cache_entries(expires_at)")
+        self._exec("CREATE INDEX IF NOT EXISTS idx_exact_cache_expires ON exact_cache_entries(expires_at)", commit=True)
 
-        c.execute(
+        self._exec(
             """
             CREATE TABLE IF NOT EXISTS semantic_cache_entries (
                 tenant_id TEXT NOT NULL,
@@ -132,13 +148,12 @@ class MemoryEngine:
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (tenant_id, user_id, session_id, prompt)
             )
-            """
+            """,
+            commit=True,
         )
-        self._ensure_column("semantic_cache_entries", "tenant_id TEXT NOT NULL DEFAULT 'default'", "tenant_id")
-        self._ensure_column("semantic_cache_entries", "user_id TEXT NOT NULL DEFAULT 'anonymous'", "user_id")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_semantic_cache_expires ON semantic_cache_entries(expires_at)")
+        self._exec("CREATE INDEX IF NOT EXISTS idx_semantic_cache_expires ON semantic_cache_entries(expires_at)", commit=True)
 
-        c.execute(
+        self._exec(
             """
             CREATE TABLE IF NOT EXISTS metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,97 +164,113 @@ class MemoryEngine:
                 value REAL NOT NULL,
                 created_at INTEGER NOT NULL
             )
-            """
+            """,
+            commit=True,
         )
-        self._ensure_column("metrics", "user_id TEXT NOT NULL DEFAULT 'anonymous'", "user_id")
-        self._ensure_column("metrics", "tenant_id TEXT NOT NULL DEFAULT 'default'", "tenant_id")
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_metrics_scope_metric_time ON metrics(tenant_id, user_id, session_id, metric_name, created_at DESC)"
-        )
-        self.conn.commit()
+        self._exec("CREATE INDEX IF NOT EXISTS idx_metrics_scope_metric_time ON metrics(tenant_id, user_id, session_id, metric_name, created_at DESC)", commit=True)
 
     def _scope(self, session_id: str, user_id: str, tenant_id: str) -> tuple[str, str, str]:
         return tenant_id, user_id, session_id
 
     def record_metric(self, session_id: str, metric_name: str, value: float = 1.0, user_id: str = "anonymous", tenant_id: str = "default") -> None:
-        self.conn.execute(
+        self._exec(
             "INSERT INTO metrics(session_id, user_id, tenant_id, metric_name, value, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (session_id, user_id, tenant_id, metric_name, float(value), int(time.time())),
+            commit=True,
         )
-        self.conn.commit()
 
     def metrics_summary(self, session_id: str, user_id: str = "anonymous", tenant_id: str = "default") -> dict:
-        rows = self.conn.execute(
+        rows = self._exec(
             "SELECT metric_name, SUM(value) AS total FROM metrics WHERE tenant_id = ? AND user_id = ? AND session_id = ? GROUP BY metric_name",
             (tenant_id, user_id, session_id),
         ).fetchall()
         return {str(r["metric_name"]): float(r["total"]) for r in rows}
 
     def remember_turn(self, session_id: str, role: str, content: str, user_id: str = "anonymous", tenant_id: str = "default") -> int:
-        cur = self.conn.execute(
+        cur = self._exec(
             "INSERT INTO interactions(session_id, user_id, tenant_id, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (session_id, user_id, tenant_id, role, content, int(time.time())),
+            commit=True,
         )
-        self.conn.commit()
         return int(cur.lastrowid)
 
     def recent_turns(self, session_id: str, limit: Optional[int] = None, user_id: str = "anonymous", tenant_id: str = "default") -> List[str]:
-        rows = self.conn.execute(
+        rows = self._exec(
             "SELECT role, content FROM interactions WHERE tenant_id = ? AND user_id = ? AND session_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
             (tenant_id, user_id, session_id, limit or self.config.short_term_size),
         ).fetchall()
         return [f"{r['role']}: {r['content']}" for r in reversed(rows)]
 
+    def recent_turn_rows(self, session_id: str, limit: Optional[int] = None, user_id: str = "anonymous", tenant_id: str = "default"):
+        return self._exec(
+            "SELECT id, role, content FROM interactions WHERE tenant_id = ? AND user_id = ? AND session_id = ? ORDER BY id DESC LIMIT ?",
+            (tenant_id, user_id, session_id, limit or self.config.short_term_size),
+        ).fetchall()
+
+    def turns_since_last_summary(self, session_id: str, user_id: str = "anonymous", tenant_id: str = "default", limit: int = 50):
+        row = self._exec(
+            "SELECT COALESCE(MAX(to_turn_id), 0) AS last_to FROM summaries WHERE tenant_id = ? AND user_id = ? AND session_id = ?",
+            (tenant_id, user_id, session_id),
+        ).fetchone()
+        last_to = int(row["last_to"]) if row else 0
+        return self._exec(
+            "SELECT id, role, content FROM interactions WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+            (tenant_id, user_id, session_id, last_to, limit),
+        ).fetchall()
+
     def remember_fact(self, session_id: str, fact: str, tag: str = "general", priority: int = 1, confidence: float = 1.0, source_turn_id: Optional[int] = None, expires_at: Optional[int] = None, user_id: str = "anonymous", tenant_id: str = "default") -> None:
-        self.conn.execute(
+        self._exec(
             "INSERT INTO facts(session_id, user_id, tenant_id, fact, tag, confidence, source_turn_id, expires_at, priority, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (session_id, user_id, tenant_id, fact, tag, confidence, source_turn_id, expires_at, priority, int(time.time())),
+            commit=True,
         )
-        self.conn.commit()
 
     def top_facts(self, session_id: str, query: str = "", limit: int = 5, user_id: str = "anonymous", tenant_id: str = "default") -> List[str]:
         now = int(time.time())
         if query:
-            rows = self.conn.execute(
+            rows = self._exec(
                 "SELECT fact FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND (expires_at IS NULL OR expires_at > ?) AND (fact LIKE ? OR tag LIKE ?) ORDER BY priority DESC, confidence DESC, created_at DESC LIMIT ?",
                 (tenant_id, user_id, session_id, now, f"%{query}%", f"%{query}%", limit),
             ).fetchall()
         else:
-            rows = self.conn.execute(
+            rows = self._exec(
                 "SELECT fact FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY priority DESC, confidence DESC, created_at DESC LIMIT ?",
                 (tenant_id, user_id, session_id, now, limit),
             ).fetchall()
         return [str(r["fact"]) for r in rows]
 
     def latest_summary(self, session_id: str, user_id: str = "anonymous", tenant_id: str = "default") -> Optional[str]:
-        row = self.conn.execute(
+        row = self._exec(
             "SELECT summary FROM summaries WHERE tenant_id = ? AND user_id = ? AND session_id = ? ORDER BY created_at DESC LIMIT 1",
             (tenant_id, user_id, session_id),
         ).fetchone()
         return str(row["summary"]) if row else None
 
     def needs_summary(self, session_id: str, user_id: str = "anonymous", tenant_id: str = "default") -> bool:
-        row = self.conn.execute(
+        row = self._exec(
             "SELECT COUNT(*) AS c FROM interactions WHERE tenant_id = ? AND user_id = ? AND session_id = ?",
             (tenant_id, user_id, session_id),
         ).fetchone()
         return int(row["c"]) >= self.config.summarizer_turn_threshold
 
     def create_summary(self, session_id: str, summary: str, from_turn_id: int, to_turn_id: int, user_id: str = "anonymous", tenant_id: str = "default") -> None:
-        self.conn.execute(
+        self._exec(
             "INSERT INTO summaries(session_id, user_id, tenant_id, summary, from_turn_id, to_turn_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (session_id, user_id, tenant_id, summary, from_turn_id, to_turn_id, int(time.time())),
+            commit=True,
         )
-        self.conn.commit()
 
     def build_context(self, session_id: str, query: str = "", user_id: str = "anonymous", tenant_id: str = "default") -> str:
         summary = self.latest_summary(session_id, user_id=user_id, tenant_id=tenant_id) or ""
         facts = self.top_facts(session_id, query=query, user_id=user_id, tenant_id=tenant_id)
         recent = self.recent_turns(session_id, user_id=user_id, tenant_id=tenant_id)
-        summary_block = f"Zusammenfassung:\n{summary}" if summary else "Zusammenfassung:\n(nicht vorhanden)"
-        facts_block = "Top Facts:\n" + "\n".join([f"- {f}" for f in facts])
-        recent_block = "Letzte Turns:\n" + "\n".join(recent)
-        return f"{summary_block}\n\n{facts_block}\n\n{recent_block}".strip()
+        return (
+            (f"Zusammenfassung:\n{summary}" if summary else "Zusammenfassung:\n(nicht vorhanden)")
+            + "\n\nTop Facts:\n"
+            + "\n".join([f"- {f}" for f in facts])
+            + "\n\nLetzte Turns:\n"
+            + "\n".join(recent)
+        ).strip()
 
     @staticmethod
     def _hash_prompt(prompt: str) -> str:
@@ -257,69 +288,64 @@ class MemoryEngine:
         return dot / (norm_a * norm_b)
 
     def get_cached(self, session_id: str, prompt: str, user_id: str = "anonymous", tenant_id: str = "default") -> Optional[str]:
-        row = self.conn.execute(
+        key = self._hash_prompt(prompt)
+        row = self._exec(
             "SELECT response, expires_at FROM exact_cache_entries WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND prompt_hash = ?",
-            (*self._scope(session_id, user_id, tenant_id), self._hash_prompt(prompt)),
+            (*self._scope(session_id, user_id, tenant_id), key),
         ).fetchone()
         if not row:
             return None
         if row["expires_at"] < int(time.time()):
-            self.conn.execute(
+            self._exec(
                 "DELETE FROM exact_cache_entries WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND prompt_hash = ?",
-                (*self._scope(session_id, user_id, tenant_id), self._hash_prompt(prompt)),
+                (*self._scope(session_id, user_id, tenant_id), key),
+                commit=True,
             )
-            self.conn.commit()
             return None
         return str(row["response"])
 
     def set_cached(self, session_id: str, prompt: str, response: str, user_id: str = "anonymous", tenant_id: str = "default") -> None:
         now = int(time.time())
-        scope = self._scope(session_id, user_id, tenant_id)
-        h = self._hash_prompt(prompt)
-        self.conn.execute(
-            "DELETE FROM exact_cache_entries WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND prompt_hash = ?",
-            (*scope, h),
+        self._exec(
+            "INSERT OR REPLACE INTO exact_cache_entries(tenant_id, user_id, session_id, prompt_hash, response, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (*self._scope(session_id, user_id, tenant_id), self._hash_prompt(prompt), response, now + self.config.cache_ttl_seconds, now),
+            commit=True,
         )
-        self.conn.execute(
-            "INSERT INTO exact_cache_entries(tenant_id, user_id, session_id, prompt_hash, response, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (*scope, h, response, now + self.config.cache_ttl_seconds, now),
-        )
-        self.conn.commit()
 
     def set_semantic_cached(self, session_id: str, prompt: str, response: str, embedding: List[float], user_id: str = "anonymous", tenant_id: str = "default") -> None:
         now = int(time.time())
-        scope = self._scope(session_id, user_id, tenant_id)
-        key_prompt = prompt.strip()
-        self.conn.execute(
-            "DELETE FROM semantic_cache_entries WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND prompt = ?",
-            (*scope, key_prompt),
+        self._exec(
+            "INSERT OR REPLACE INTO semantic_cache_entries(tenant_id, user_id, session_id, prompt, response, embedding_json, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (*self._scope(session_id, user_id, tenant_id), prompt.strip(), response, json.dumps(embedding), now + self.config.cache_ttl_seconds, now),
+            commit=True,
         )
-        self.conn.execute(
-            "INSERT INTO semantic_cache_entries(tenant_id, user_id, session_id, prompt, response, embedding_json, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (*scope, key_prompt, response, json.dumps(embedding), now + self.config.cache_ttl_seconds, now),
-        )
-        self.conn.commit()
 
     def get_semantic_cached(self, session_id: str, prompt: str, embedder: Callable[[str], List[float]], threshold: Optional[float] = None, candidate_limit: Optional[int] = None, user_id: str = "anonymous", tenant_id: str = "default") -> Optional[str]:
         now = int(time.time())
-        self.conn.execute(
+        self._exec(
             "DELETE FROM semantic_cache_entries WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND expires_at < ?",
             (*self._scope(session_id, user_id, tenant_id), now),
+            commit=True,
         )
-        self.conn.commit()
         query_embedding = embedder(prompt)
         if not query_embedding:
             return None
-        rows = self.conn.execute(
+        rows = self._exec(
             "SELECT response, embedding_json FROM semantic_cache_entries WHERE tenant_id = ? AND user_id = ? AND session_id = ? ORDER BY created_at DESC LIMIT ?",
             (*self._scope(session_id, user_id, tenant_id), candidate_limit or self.config.semantic_candidate_limit),
         ).fetchall()
-        best_response = None
+
         best_sim = -1.0
+        best_response = None
+        expected_dim = len(query_embedding)
         for row in rows:
             try:
                 emb = json.loads(row["embedding_json"])
             except json.JSONDecodeError:
+                logger.warning("invalid embedding_json encountered")
+                continue
+            if len(emb) != expected_dim:
+                logger.warning("embedding dimension mismatch: %s != %s", len(emb), expected_dim)
                 continue
             sim = self._cosine_similarity(query_embedding, emb)
             if sim > best_sim:
@@ -330,10 +356,9 @@ class MemoryEngine:
 
     def purge_expired_cache(self) -> int:
         now = int(time.time())
-        exact = self.conn.execute("DELETE FROM exact_cache_entries WHERE expires_at < ?", (now,)).rowcount or 0
-        semantic = self.conn.execute("DELETE FROM semantic_cache_entries WHERE expires_at < ?", (now,)).rowcount or 0
-        self.conn.execute("DELETE FROM facts WHERE expires_at IS NOT NULL AND expires_at < ?", (now,))
-        self.conn.commit()
+        exact = self._exec("DELETE FROM exact_cache_entries WHERE expires_at < ?", (now,), commit=True).rowcount or 0
+        semantic = self._exec("DELETE FROM semantic_cache_entries WHERE expires_at < ?", (now,), commit=True).rowcount or 0
+        self._exec("DELETE FROM facts WHERE expires_at IS NOT NULL AND expires_at < ?", (now,), commit=True)
         return int(exact + semantic)
 
 
