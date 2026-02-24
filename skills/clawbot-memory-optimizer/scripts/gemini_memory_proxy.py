@@ -312,6 +312,9 @@ def chat() -> Any:
     if not user_prompt:
         return jsonify({"error": "prompt fehlt"}), 400
 
+    # D4 hardening: periodic cleanup hooks
+    engine.cleanup_stale_phase_d_state()
+
     if _has_any(user_prompt, FORGET_TRIGGERS):
         deleted = engine.forget_facts(session_id=session_id, pattern=user_prompt, user_id=user_id, tenant_id=tenant_id)
         engine.record_metric(session_id, "trigger_forget_hit", 1, user_id=user_id, tenant_id=tenant_id)
@@ -396,7 +399,8 @@ def chat() -> Any:
         return jsonify({"response": semantic, "source": "semantic_cache", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
 
     maybe_generate_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id)
-    context = engine.build_context(session_id=session_id, query=user_prompt, user_id=user_id, tenant_id=tenant_id)
+    include_governance = bool(body.get("include_governance_context", False))
+    context = engine.build_context(session_id=session_id, query=user_prompt, user_id=user_id, tenant_id=tenant_id, include_reflection_queue=include_governance)
     answer = scrub_pii(call_gemini(f"{context}\n\nUser: {user_prompt}"))
 
     engine.remember_turn(session_id, "assistant", answer, user_id=user_id, tenant_id=tenant_id)
@@ -488,6 +492,10 @@ def api_agent_register() -> Any:
 @app.post("/api/proposal/submit")
 def api_proposal_submit() -> Any:
     body = request.get_json(force=True)
+    if not str(body.get("agent_name", "")).strip():
+        return jsonify({"error": "agent_name fehlt"}), 400
+    if not str(body.get("content", "")).strip():
+        return jsonify({"error": "content fehlt"}), 400
     pid = engine.submit_proposal(
         tenant_id=str(body.get("tenant_id", "default")),
         agent_name=str(body.get("agent_name", "")),
@@ -531,6 +539,28 @@ def api_proposal_review() -> Any:
             rejection_reason=str(body.get("comment", "")),
         )
     return (jsonify({"status": "success"}), 200) if ok else (jsonify({"error": "review failed"}), 400)
+
+
+@app.get("/api/audit")
+def api_audit() -> Any:
+    tenant_id = str(request.args.get("tenant_id", "default"))
+    action_type = request.args.get("action_type")
+    target_store = request.args.get("target_store")
+    limit = int(request.args.get("limit", "100"))
+    return jsonify({"items": engine.get_audit_log(tenant_id=tenant_id, action_type=action_type, target_store=target_store, limit=limit)})
+
+
+@app.post("/api/admin/maintenance")
+def api_admin_maintenance() -> Any:
+    result = engine.cleanup_stale_phase_d_state()
+    return jsonify({"status": "ok", "maintenance": result})
+
+
+@app.get("/api/health/phase-d")
+def api_phase_d_health() -> Any:
+    tenant_id = str(request.args.get("tenant_id", "default"))
+    user_id = str(request.args.get("user_id", "anonymous"))
+    return jsonify(engine.phase_d_health(tenant_id=tenant_id, user_id=user_id))
 
 
 @app.get("/metrics")

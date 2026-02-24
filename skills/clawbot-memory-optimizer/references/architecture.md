@@ -55,3 +55,14 @@
 3. **Vorbereitung für D4**
    - Audit- und Retention-Basis bleibt intakt
    - Erweiterte Governance/Analytics können darauf aufbauen
+
+
+## Phase D4 (umgesetzt)
+1. **Integration/Hardening**
+   - Chat-Flow triggert periodische Maintenance für veraltete D-States
+   - Proposal-Ausführung mit zusätzlicher Input-/Pflichtfeld-Validierung
+2. **Governance-Observability**
+   - Audit- und Health-Endpunkte für operative Transparenz
+   - Maintenance-Endpunkt für manuelle/automatisierte Bereinigung
+3. **E2E-Betriebsfähigkeit**
+   - A+B+C+D-Pfade gemeinsam validierbar (Memory, Reflection, Proposals, Audit)

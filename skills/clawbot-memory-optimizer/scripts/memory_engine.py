@@ -679,7 +679,7 @@ class MemoryEngine:
             commit=True,
         )
 
-    def build_context(self, session_id: str, query: str = "", user_id: str = "anonymous", tenant_id: str = "default") -> str:
+    def build_context(self, session_id: str, query: str = "", user_id: str = "anonymous", tenant_id: str = "default", include_reflection_queue: bool = False) -> str:
         summary = self.latest_summary(session_id, user_id=user_id, tenant_id=tenant_id) or ""
         identity_facts = self.identity_context(tenant_id=tenant_id, max_tokens=self.config.context_block_budget_identity)
         soul_values = self.soul_context(tenant_id=tenant_id, max_tokens=self.config.context_block_budget_soul)
@@ -701,6 +701,14 @@ class MemoryEngine:
             self._format_block("Graph Relationen", relations if relations else ["(keine)"], self.config.context_block_budget_graph_relations),
             self._format_block("Letzte Turns", recent if recent else ["(keine)"], self.config.context_block_budget_recent_turns),
         ]
+        if include_reflection_queue:
+            pending_reflection = self.get_pending_reflection(tenant_id=tenant_id, user_id=user_id)
+            if pending_reflection:
+                blocks.append(self._format_block("Ausstehende Reflexion", [f"id={pending_reflection['id']} tokens={pending_reflection['tokens_requested']}"], 40))
+            pending_props = self.get_pending_proposals(tenant_id=tenant_id, limit=3)
+            if pending_props:
+                prop_lines = [f"[{p['agent_name']}] {p['target_store']}:{p['proposal_type']}" for p in pending_props]
+                blocks.append(self._format_block("Ausstehende Proposals", prop_lines, 50))
         return self._cap_global_budget("\n\n".join(blocks), self.config.context_token_budget)
 
     @staticmethod
@@ -847,7 +855,27 @@ class MemoryEngine:
             (proposal_cutoff,),
             commit=True,
         ).rowcount or 0
-        return {"expired_proposals": int(expired_proposals), "deleted_reflection_queue_rows": int(old_reflections)}
+        old_audit = self.cleanup_old_audit_logs()
+        return {"expired_proposals": int(expired_proposals), "deleted_reflection_queue_rows": int(old_reflections), "deleted_audit_rows": int(old_audit)}
+
+    def phase_d_health(self, tenant_id: str, user_id: str) -> dict:
+        pending_reflection = self._exec(
+            "SELECT COUNT(*) AS c FROM reflection_queue WHERE tenant_id = ? AND user_id = ? AND status = 'pending'",
+            (tenant_id, user_id),
+        ).fetchone()
+        pending_props = self._exec(
+            "SELECT COUNT(*) AS c FROM memory_proposals WHERE tenant_id = ? AND status = 'pending'",
+            (tenant_id,),
+        ).fetchone()
+        approved_props = self._exec(
+            "SELECT COUNT(*) AS c FROM memory_proposals WHERE tenant_id = ? AND status = 'approved'",
+            (tenant_id,),
+        ).fetchone()
+        return {
+            "pending_reflections": int(pending_reflection["c"]),
+            "pending_proposals": int(pending_props["c"]),
+            "approved_proposals": int(approved_props["c"]),
+        }
 
     def request_reflection(self, tenant_id: str, user_id: str, trigger_type: str = "explicit", token_reason: str = "", priority: int = 1) -> int:
         now = int(time.time())
@@ -1002,6 +1030,12 @@ class MemoryEngine:
     def submit_proposal(self, tenant_id: str, agent_name: str, target_store: str, proposal_type: str, content: str, confidence: str = "medium", priority: int = 1) -> Optional[int]:
         if not self.can_propose(tenant_id, agent_name):
             return None
+        if target_store not in {"facts", "entities", "relations", "identity", "soul"}:
+            return None
+        if proposal_type not in {"add", "update", "delete", "merge"}:
+            return None
+        if not content or len(content) > 8000:
+            return None
         c_row = self._exec(
             "SELECT COUNT(*) AS c FROM memory_proposals WHERE tenant_id = ? AND agent_name = ? AND status = 'pending'",
             (tenant_id, agent_name),
@@ -1097,10 +1131,15 @@ class MemoryEngine:
             return False
         try:
             if target_store == "facts":
+                if proposal_type not in {"add", "delete"}:
+                    return False
                 if proposal_type == "add":
+                    fact_text = str(data.get("fact", "")).strip()
+                    if not fact_text:
+                        return False
                     self.remember_fact(
                         session_id=str(data.get("session_id", "default")),
-                        fact=str(data.get("fact", "")).strip(),
+                        fact=fact_text,
                         tag=str(data.get("tag", "proposed")),
                         priority=int(data.get("priority", 1)),
                         memory_scope=str(data.get("memory_scope", "user")),
@@ -1118,6 +1157,8 @@ class MemoryEngine:
                 else:
                     return False
             elif target_store == "entities" and proposal_type == "add":
+                if not str(data.get("entity_name", "")).strip():
+                    return False
                 self.upsert_entity(
                     tenant_id=tenant_id,
                     user_id=str(data.get("user_id", "anonymous")),
@@ -1127,6 +1168,8 @@ class MemoryEngine:
                     confidence=float(data.get("confidence", 0.7)),
                 )
             elif target_store == "relations" and proposal_type == "add":
+                if int(data.get("source_entity_id", 0)) <= 0 or int(data.get("target_entity_id", 0)) <= 0:
+                    return False
                 self.upsert_relation(
                     tenant_id=tenant_id,
                     user_id=str(data.get("user_id", "anonymous")),
@@ -1136,6 +1179,8 @@ class MemoryEngine:
                     strength=float(data.get("strength", 0.7)),
                 )
             elif target_store == "identity" and proposal_type in {"add", "update"}:
+                if not str(data.get("content", "")).strip():
+                    return False
                 self.set_identity(
                     tenant_id=tenant_id,
                     category=str(data.get("category", "general")),
@@ -1143,6 +1188,8 @@ class MemoryEngine:
                     stability=str(data.get("stability", "dynamic")),
                 )
             elif target_store == "soul" and proposal_type in {"add", "update"}:
+                if not str(data.get("content", "")).strip():
+                    return False
                 self.set_soul(
                     tenant_id=tenant_id,
                     category=str(data.get("category", "values")),

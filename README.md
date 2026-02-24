@@ -35,3 +35,10 @@ Installierbarer Skill für ClawBot mit disk-first Memory, exact/semantic cache, 
 - Proposal-Lifecycle: `submit -> pending -> approve/reject` mit direkter Ausführung bei Approve
 - Proposal-API: `/api/agent/register`, `/api/proposal/submit`, `/api/proposal/pending`, `/api/proposal/review`
 - Für D4 vorbereitet: Audit-/Retention-Basis und Governance-Statusfelder sind vorhanden
+
+
+## Phase D4 umgesetzt (Integration/Hardening)
+- Hardening-Hooks: periodische Maintenance im Chat-Flow (`cleanup_stale_phase_d_state`)
+- Governance-Transparenz: neue Endpunkte `/api/audit`, `/api/admin/maintenance`, `/api/health/phase-d`
+- Context-Integration: optionaler Governance-Block in `build_context(..., include_reflection_queue=True)`
+- Input/Execution-Validation bei Proposals verschärft (Target/Type/Content/Pflichtfelder)

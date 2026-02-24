@@ -64,6 +64,11 @@ def main() -> None:
     print("Pending Proposals:", engine.get_pending_proposals(tenant_id=tenant, limit=3))
     print("Approved Proposal:", engine.approve_proposal(proposal_id=int(pid or 0), tenant_id=tenant, reviewer_agent="main", review_comment="looks good"))
 
+    print("\nD4 Hardening Demo:")
+    print("Phase-D Health:", engine.phase_d_health(tenant_id=tenant, user_id=user))
+    print("Maintenance:", engine.cleanup_stale_phase_d_state())
+    print("Audit (last 5):", engine.get_audit_log(tenant_id=tenant, limit=5))
+
 
 if __name__ == "__main__":
     main()

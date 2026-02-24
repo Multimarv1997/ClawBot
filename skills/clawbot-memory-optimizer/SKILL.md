@@ -36,3 +36,6 @@ description: "Installierbarer Skill für ClawBot mit RAM-sparendem SQLite-Memory
 
 24. Setze D3 um: Multi-Agent Proposal-Workflow (Registry, Submit, Review/Execute).
 25. Halte D4 für Governance-Feinschliff, Analytics und Retention-Policies vorbereitet.
+
+26. Setze D4 um: Integration/Hardening (Maintenance, Audit/Health-Endpoints, strengere Proposal-Validierung).
+27. Prüfe End-to-End alle Phasen A bis D gemeinsam (Context, Reflection, Proposal, Audit).
