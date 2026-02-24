@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from typing import Any, List, Optional
 
@@ -50,8 +51,6 @@ ENABLE_LLM_ENTITY_EXTRACTION = os.getenv("ENABLE_LLM_ENTITY_EXTRACTION", "0") ==
 
 REMEMBER_TRIGGERS = ["remember", "don't forget", "keep in mind", "note that", "save this", "merke dir", "vergiss nicht", "wichtig"]
 FORGET_TRIGGERS = ["forget", "never mind", "disregard", "remove from memory", "vergiss", "streichen", "egal"]
-REFLECT_TRIGGERS = ["reflect", "review memory", "consolidate", "reflektiere", "gedächtnis prüfen"]
-
 REFLECTION_EXPLICIT_TRIGGERS = [
     "reflect", "let's reflect", "reflektiere", "consolidate memories", "überprüfe mein gedächtnis", "self-review", "selbstreflexion"
 ]
@@ -79,6 +78,7 @@ engine.init_db()
 
 LAST_MAINTENANCE_AT = 0.0
 MAINTENANCE_INTERVAL_S = int(os.getenv("MAINTENANCE_INTERVAL_S", "60"))
+MAINTENANCE_LOCK = threading.Lock()
 
 
 def _safe_int(value: Any, default: int, minimum: Optional[int] = None) -> int:
@@ -342,10 +342,11 @@ def chat() -> Any:
     # D4 hardening: periodic cleanup hooks (debounced)
     global LAST_MAINTENANCE_AT
     now_ts = time.time()
-    if now_ts - LAST_MAINTENANCE_AT >= MAINTENANCE_INTERVAL_S:
-        engine.cleanup_stale_phase_d_state()
-        engine.apply_fact_maintenance(tenant_id=tenant_id, user_id=user_id)
-        LAST_MAINTENANCE_AT = now_ts
+    with MAINTENANCE_LOCK:
+        if now_ts - LAST_MAINTENANCE_AT >= MAINTENANCE_INTERVAL_S:
+            engine.cleanup_stale_phase_d_state()
+            engine.apply_fact_maintenance(tenant_id=tenant_id, user_id=user_id)
+            LAST_MAINTENANCE_AT = now_ts
 
     if _has_any(user_prompt, FORGET_TRIGGERS):
         deleted = engine.forget_facts(session_id=session_id, pattern=user_prompt, user_id=user_id, tenant_id=tenant_id)
@@ -483,6 +484,8 @@ def api_reflection_reject() -> Any:
 @app.post("/api/reflection/execute")
 def api_reflection_execute() -> Any:
     body = request.get_json(force=True)
+    if not str(body.get("reflection_text", "")).strip():
+        return jsonify({"error": "reflection_text fehlt"}), 400
     ok = engine.execute_reflection(
         reflection_id=_safe_int(body.get("reflection_id", 0), 0, minimum=0),
         tenant_id=str(body.get("tenant_id", "default")),
@@ -511,12 +514,16 @@ def api_reflection_history() -> Any:
 @app.post("/api/agent/register")
 def api_agent_register() -> Any:
     body = request.get_json(force=True)
+    if not str(body.get("agent_name", "")).strip():
+        return jsonify({"error": "agent_name fehlt"}), 400
     aid = engine.register_agent(
         tenant_id=str(body.get("tenant_id", "default")),
         agent_name=str(body.get("agent_name", "")),
         agent_type=str(body.get("agent_type", "subagent")),
         permissions=str(body.get("permissions", "read")),
     )
+    if aid <= 0:
+        return jsonify({"error": "agent registration failed"}), 400
     return jsonify({"agent_id": aid})
 
 

@@ -850,11 +850,28 @@ class MemoryEngine:
     def cleanup_stale_phase_d_state(self) -> dict:
         now = int(time.time())
         proposal_cutoff = now - self.config.proposal_auto_expire_hours * 3600
+        expired_rows = self._exec(
+            "SELECT id, tenant_id, agent_name, target_store, proposal_type FROM memory_proposals WHERE status = 'pending' AND created_at < ?",
+            (proposal_cutoff,),
+        ).fetchall()
         expired_proposals = self._exec(
             "UPDATE memory_proposals SET status = 'rejected', rejection_reason = COALESCE(rejection_reason, 'auto_expired'), rejected_at = ?, updated_at = ? WHERE status = 'pending' AND created_at < ?",
             (now, now, proposal_cutoff),
             commit=True,
         ).rowcount or 0
+        for row in expired_rows:
+            self._log_audit(
+                tenant_id=str(row["tenant_id"]),
+                user_id="system",
+                action_type="proposal_reject_auto",
+                target_store=str(row["target_store"] or "memory_proposals"),
+                target_id=int(row["id"]),
+                details={
+                    "original_agent": str(row["agent_name"]),
+                    "proposal_type": str(row["proposal_type"]),
+                    "reason": "auto_expired",
+                },
+            )
         old_reflections = self._exec(
             "DELETE FROM reflection_queue WHERE status IN ('executed', 'rejected') AND updated_at < ?",
             (proposal_cutoff,),
@@ -876,10 +893,15 @@ class MemoryEngine:
             "SELECT COUNT(*) AS c FROM memory_proposals WHERE tenant_id = ? AND status = 'approved'",
             (tenant_id,),
         ).fetchone()
+        executed_props = self._exec(
+            "SELECT COUNT(*) AS c FROM memory_proposals WHERE tenant_id = ? AND status = 'executed'",
+            (tenant_id,),
+        ).fetchone()
         return {
             "pending_reflections": int(pending_reflection["c"]),
             "pending_proposals": int(pending_props["c"]),
             "approved_proposals": int(approved_props["c"]),
+            "executed_proposals": int(executed_props["c"]),
         }
 
     def request_reflection(self, tenant_id: str, user_id: str, trigger_type: str = "explicit", token_reason: str = "", priority: int = 1) -> int:
@@ -946,6 +968,9 @@ class MemoryEngine:
         return bool(ok)
 
     def execute_reflection(self, reflection_id: int, tenant_id: str, user_id: str, reflection_text: str) -> bool:
+        text = reflection_text.strip()
+        if not text:
+            return False
         row = self._exec(
             "SELECT tokens_used, elements_used FROM reflection_queue WHERE id = ? AND tenant_id = ? AND user_id = ? AND status = 'approved'",
             (reflection_id, tenant_id, user_id),
@@ -955,14 +980,16 @@ class MemoryEngine:
         now = int(time.time())
         tokens_used = int(row["tokens_used"] or self.config.reflection_baseline_tokens)
         elements = row["elements_used"] or "[]"
-        self._exec(
-            "INSERT INTO reflection_log(tenant_id, user_id, reflection_text, elements_used, tokens_used, memory_insights, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (tenant_id, user_id, reflection_text[:4000], elements, tokens_used, None, now),
+        cur = self._exec(
+            "UPDATE reflection_queue SET status = 'executed', executed_at = ?, updated_at = ?, reflection_text = ? WHERE id = ? AND tenant_id = ? AND user_id = ? AND status = 'approved'",
+            (now, now, text[:4000], reflection_id, tenant_id, user_id),
             commit=True,
         )
+        if (cur.rowcount or 0) <= 0:
+            return False
         self._exec(
-            "UPDATE reflection_queue SET status = 'executed', executed_at = ?, updated_at = ?, reflection_text = ? WHERE id = ? AND tenant_id = ? AND user_id = ? AND status = 'approved'",
-            (now, now, reflection_text[:4000], reflection_id, tenant_id, user_id),
+            "INSERT INTO reflection_log(tenant_id, user_id, reflection_text, elements_used, tokens_used, memory_insights, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tenant_id, user_id, text[:4000], elements, tokens_used, None, now),
             commit=True,
         )
         self._log_audit(tenant_id, user_id, "reflection_execute", "reflection_queue", reflection_id, {"tokens_used": tokens_used})
@@ -986,6 +1013,9 @@ class MemoryEngine:
 
     def register_agent(self, tenant_id: str, agent_name: str, agent_type: str = "subagent", permissions: str = "read") -> int:
         now = int(time.time())
+        clean_agent_name = agent_name.strip()
+        if not clean_agent_name:
+            return 0
         a_type = "main" if agent_type == "main" else "subagent"
         allowed = {"read", "propose", "write"}
         perms = permissions if permissions in allowed else "read"
@@ -993,7 +1023,7 @@ class MemoryEngine:
             perms = "propose"
         row = self._exec(
             "SELECT id FROM agents WHERE tenant_id = ? AND agent_name = ?",
-            (tenant_id, agent_name),
+            (tenant_id, clean_agent_name),
         ).fetchone()
         if row:
             self._exec(
@@ -1005,11 +1035,11 @@ class MemoryEngine:
         else:
             cur = self._exec(
                 "INSERT INTO agents(tenant_id, agent_name, agent_type, permissions, active, created_at, last_active_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
-                (tenant_id, agent_name, a_type, perms, now, now),
+                (tenant_id, clean_agent_name, a_type, perms, now, now),
                 commit=True,
             )
             aid = int(cur.lastrowid)
-        self._log_audit(tenant_id, f"agent:{agent_name}", "agent_register", "agents", aid, {"agent_type": a_type, "permissions": perms})
+        self._log_audit(tenant_id, f"agent:{clean_agent_name}", "agent_register", "agents", aid, {"agent_type": a_type, "permissions": perms})
         return aid
 
     def get_agent(self, tenant_id: str, agent_name: str) -> Optional[dict]:
@@ -1037,7 +1067,14 @@ class MemoryEngine:
             return None
         if target_store not in {"facts", "entities", "relations", "identity", "soul"}:
             return None
-        if proposal_type not in {"add", "update", "delete", "merge"}:
+        allowed_by_store = {
+            "facts": {"add", "delete"},
+            "entities": {"add"},
+            "relations": {"add"},
+            "identity": {"add", "update"},
+            "soul": {"add", "update"},
+        }
+        if proposal_type not in allowed_by_store.get(target_store, set()):
             return None
         if not content or len(content) > 8000:
             return None
@@ -1100,10 +1137,17 @@ class MemoryEngine:
             content=str(row["content"]),
         )
         if not ok:
+            now = int(time.time())
+            self._exec(
+                "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'",
+                (reviewer_agent, "execution_failed", now, now, proposal_id),
+                commit=True,
+            )
+            self._log_audit(tenant_id, f"agent:{reviewer_agent}", "proposal_reject", str(row["target_store"]), proposal_id, {"original_agent": str(row["agent_name"]), "proposal_type": str(row["proposal_type"]), "reason": "execution_failed"})
             return False
         now = int(time.time())
         self._exec(
-            "UPDATE memory_proposals SET status = 'approved', reviewed_by = ?, review_comment = ?, approved_at = ?, executed_at = ?, updated_at = ? WHERE id = ?",
+            "UPDATE memory_proposals SET status = 'executed', reviewed_by = ?, review_comment = ?, approved_at = ?, executed_at = ?, updated_at = ? WHERE id = ?",
             (reviewer_agent, review_comment[:240], now, now, now, proposal_id),
             commit=True,
         )
@@ -1352,12 +1396,14 @@ class MemoryEngine:
 
         return int(deleted_unhit + deleted_archived)
 
-    def purge_expired_cache(self) -> int:
+    def purge_expired_cache(self, tenant_id: Optional[str] = None, user_id: Optional[str] = None, session_id: Optional[str] = None) -> int:
         now = int(time.time())
         exact = self._exec("DELETE FROM exact_cache_entries WHERE expires_at < ?", (now,), commit=True).rowcount or 0
         semantic = self._exec("DELETE FROM semantic_cache_entries WHERE expires_at < ?", (now,), commit=True).rowcount or 0
         self._exec("DELETE FROM facts WHERE expires_at IS NOT NULL AND expires_at < ?", (now,), commit=True)
-        deleted_facts = self.apply_fact_maintenance()
+        deleted_facts = 0
+        if tenant_id is not None or user_id is not None or session_id is not None:
+            deleted_facts = self.apply_fact_maintenance(tenant_id=tenant_id, user_id=user_id, session_id=session_id)
         return int(exact + semantic + deleted_facts)
 
 
