@@ -77,6 +77,39 @@ app = Flask(__name__)
 engine = MemoryEngine()
 engine.init_db()
 
+LAST_MAINTENANCE_AT = 0.0
+MAINTENANCE_INTERVAL_S = int(os.getenv("MAINTENANCE_INTERVAL_S", "60"))
+
+
+def _safe_int(value: Any, default: int, minimum: Optional[int] = None) -> int:
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        out = max(minimum, out)
+    return out
+
+
+def _parse_llm_json(raw: str) -> Any:
+    text = raw.strip()
+    if text.startswith("```"):
+        parts = text.split("```")
+        if len(parts) >= 3:
+            text = parts[1]
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"(\[.*\]|\{.*\})", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                return None
+        return None
+
 
 def get_api_key() -> str:
     return os.getenv("GEMINI_API_KEY", "").strip()
@@ -186,11 +219,8 @@ def extract_facts_with_llm(text: str) -> list[dict]:
         f"Text:\n{text}"
     )
     raw = call_gemini(payload)
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, list) else []
-    except json.JSONDecodeError:
-        return []
+    data = _parse_llm_json(raw)
+    return data if isinstance(data, list) else []
 
 
 
@@ -213,11 +243,8 @@ def extract_entities_with_llm(text: str) -> list[dict]:
         f"Text:\n{text}"
     )
     raw = call_gemini(prompt)
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, list) else []
-    except json.JSONDecodeError:
-        return []
+    data = _parse_llm_json(raw)
+    return data if isinstance(data, list) else []
 
 
 def update_knowledge_graph_from_fact(fact_text: str, tenant_id: str, user_id: str) -> None:
@@ -312,8 +339,13 @@ def chat() -> Any:
     if not user_prompt:
         return jsonify({"error": "prompt fehlt"}), 400
 
-    # D4 hardening: periodic cleanup hooks
-    engine.cleanup_stale_phase_d_state()
+    # D4 hardening: periodic cleanup hooks (debounced)
+    global LAST_MAINTENANCE_AT
+    now_ts = time.time()
+    if now_ts - LAST_MAINTENANCE_AT >= MAINTENANCE_INTERVAL_S:
+        engine.cleanup_stale_phase_d_state()
+        engine.apply_fact_maintenance(tenant_id=tenant_id, user_id=user_id)
+        LAST_MAINTENANCE_AT = now_ts
 
     if _has_any(user_prompt, FORGET_TRIGGERS):
         deleted = engine.forget_facts(session_id=session_id, pattern=user_prompt, user_id=user_id, tenant_id=tenant_id)
@@ -332,7 +364,6 @@ def chat() -> Any:
             "reflection": reflection_signal,
         })
 
-    engine.apply_fact_maintenance()
     track_topic_metrics(session_id, user_prompt, user_id, tenant_id)
     turn_id = engine.remember_turn(session_id, "user", user_prompt, user_id=user_id, tenant_id=tenant_id)
 
@@ -419,7 +450,7 @@ def api_reflection_request() -> Any:
     user_id = str(body.get("user_id", "anonymous"))
     trigger_type = str(body.get("trigger_type", "explicit"))
     token_reason = str(body.get("token_reason", ""))
-    priority = int(body.get("priority", 1))
+    priority = _safe_int(body.get("priority", 1), 1, minimum=1)
     rid = engine.request_reflection(tenant_id=tenant_id, user_id=user_id, trigger_type=trigger_type, token_reason=token_reason, priority=priority)
     return jsonify({"status": "pending", "request_id": rid})
 
@@ -428,7 +459,7 @@ def api_reflection_request() -> Any:
 def api_reflection_approve() -> Any:
     body = request.get_json(force=True)
     ok = engine.approve_reflection(
-        reflection_id=int(body.get("reflection_id", 0)),
+        reflection_id=_safe_int(body.get("reflection_id", 0), 0, minimum=0),
         tenant_id=str(body.get("tenant_id", "default")),
         user_id=str(body.get("user_id", "anonymous")),
         approved_tokens=body.get("approved_tokens"),
@@ -441,7 +472,7 @@ def api_reflection_approve() -> Any:
 def api_reflection_reject() -> Any:
     body = request.get_json(force=True)
     ok = engine.reject_reflection(
-        reflection_id=int(body.get("reflection_id", 0)),
+        reflection_id=_safe_int(body.get("reflection_id", 0), 0, minimum=0),
         tenant_id=str(body.get("tenant_id", "default")),
         user_id=str(body.get("user_id", "anonymous")),
         rejection_reason=str(body.get("rejection_reason", "")),
@@ -453,7 +484,7 @@ def api_reflection_reject() -> Any:
 def api_reflection_execute() -> Any:
     body = request.get_json(force=True)
     ok = engine.execute_reflection(
-        reflection_id=int(body.get("reflection_id", 0)),
+        reflection_id=_safe_int(body.get("reflection_id", 0), 0, minimum=0),
         tenant_id=str(body.get("tenant_id", "default")),
         user_id=str(body.get("user_id", "anonymous")),
         reflection_text=str(body.get("reflection_text", "")),
@@ -473,7 +504,7 @@ def api_reflection_pending() -> Any:
 def api_reflection_history() -> Any:
     tenant_id = str(request.args.get("tenant_id", "default"))
     user_id = str(request.args.get("user_id", "anonymous"))
-    limit = int(request.args.get("limit", "10"))
+    limit = _safe_int(request.args.get("limit", "10"), 10, minimum=1)
     return jsonify({"items": engine.get_reflection_history(tenant_id=tenant_id, user_id=user_id, limit=limit)})
 
 
@@ -503,7 +534,7 @@ def api_proposal_submit() -> Any:
         proposal_type=str(body.get("proposal_type", "add")),
         content=str(body.get("content", "")),
         confidence=str(body.get("confidence", "medium")),
-        priority=int(body.get("priority", 1)),
+        priority=_safe_int(body.get("priority", 1), 1, minimum=1),
     )
     if pid is None:
         return jsonify({"error": "not authorized or too many pending proposals"}), 403
@@ -515,7 +546,7 @@ def api_proposal_pending() -> Any:
     tenant_id = str(request.args.get("tenant_id", "default"))
     target_store = request.args.get("target_store")
     agent_name = request.args.get("agent_name")
-    limit = int(request.args.get("limit", "20"))
+    limit = _safe_int(request.args.get("limit", "20"), 20, minimum=1)
     items = engine.get_pending_proposals(tenant_id=tenant_id, target_store=target_store, agent_name=agent_name, limit=limit)
     return jsonify({"items": items})
 
@@ -523,17 +554,19 @@ def api_proposal_pending() -> Any:
 @app.post("/api/proposal/review")
 def api_proposal_review() -> Any:
     body = request.get_json(force=True)
-    action = str(body.get("action", "reject"))
+    action = str(body.get("action", "")).strip().lower()
+    if action not in {"approve", "reject"}:
+        return jsonify({"error": "action muss approve oder reject sein"}), 400
     if action == "approve":
         ok = engine.approve_proposal(
-            proposal_id=int(body.get("proposal_id", 0)),
+            proposal_id=_safe_int(body.get("proposal_id", 0), 0, minimum=0),
             tenant_id=str(body.get("tenant_id", "default")),
             reviewer_agent=str(body.get("reviewer_agent", "")),
             review_comment=str(body.get("comment", "")),
         )
     else:
         ok = engine.reject_proposal(
-            proposal_id=int(body.get("proposal_id", 0)),
+            proposal_id=_safe_int(body.get("proposal_id", 0), 0, minimum=0),
             tenant_id=str(body.get("tenant_id", "default")),
             reviewer_agent=str(body.get("reviewer_agent", "")),
             rejection_reason=str(body.get("comment", "")),
@@ -546,7 +579,7 @@ def api_audit() -> Any:
     tenant_id = str(request.args.get("tenant_id", "default"))
     action_type = request.args.get("action_type")
     target_store = request.args.get("target_store")
-    limit = int(request.args.get("limit", "100"))
+    limit = _safe_int(request.args.get("limit", "100"), 100, minimum=1)
     return jsonify({"items": engine.get_audit_log(tenant_id=tenant_id, action_type=action_type, target_store=target_store, limit=limit)})
 
 
@@ -572,4 +605,4 @@ def metrics() -> Any:
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    app.run(host="0.0.0.0", port=_safe_int(os.getenv("PORT", "8080"), 8080, minimum=1))

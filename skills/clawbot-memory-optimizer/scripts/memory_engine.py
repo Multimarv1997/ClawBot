@@ -9,6 +9,7 @@ import math
 import re
 import sqlite3
 import time
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -65,16 +66,18 @@ TYPE_WEIGHTS = {
 class MemoryEngine:
     def __init__(self, config: Optional[MemoryConfig] = None) -> None:
         self.config = config or MemoryConfig()
-        self.conn = sqlite3.connect(self.config.db_path, timeout=10)
+        self.conn = sqlite3.connect(self.config.db_path, timeout=10, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._db_lock = threading.RLock()
 
     def _exec(self, sql: str, params: tuple = (), commit: bool = False):
         for i in range(3):
             try:
-                cur = self.conn.execute(sql, params)
-                if commit:
-                    self.conn.commit()
-                return cur
+                with self._db_lock:
+                    cur = self.conn.execute(sql, params)
+                    if commit:
+                        self.conn.commit()
+                    return cur
             except sqlite3.OperationalError as err:
                 if "locked" in str(err).lower() and i < 2:
                     time.sleep(0.05 * (i + 1))
@@ -121,6 +124,7 @@ class MemoryEngine:
                 memory_type TEXT NOT NULL DEFAULT 'semantic',
                 memory_status TEXT NOT NULL DEFAULT 'active',
                 relevance_score REAL NOT NULL DEFAULT 1.0,
+                relevance_base REAL NOT NULL DEFAULT 1.0,
                 fact_key TEXT,
                 fact TEXT NOT NULL,
                 tag TEXT,
@@ -145,6 +149,7 @@ class MemoryEngine:
             ("memory_type TEXT NOT NULL DEFAULT 'semantic'", "memory_type"),
             ("memory_status TEXT NOT NULL DEFAULT 'active'", "memory_status"),
             ("relevance_score REAL NOT NULL DEFAULT 1.0", "relevance_score"),
+            ("relevance_base REAL NOT NULL DEFAULT 1.0", "relevance_base"),
             ("fact_key TEXT", "fact_key"),
             ("confidence REAL NOT NULL DEFAULT 1.0", "confidence"),
             ("source_turn_id INTEGER", "source_turn_id"),
@@ -512,15 +517,15 @@ class MemoryEngine:
             if ("nicht" in old_fact and "nicht" not in new_fact) or ("nicht" in new_fact and "nicht" not in old_fact):
                 conflict_group = fact_key
             self._exec(
-                "UPDATE facts SET fact = ?, tag = ?, confidence = ?, priority = ?, hit_count = hit_count + 1, relevance_score = ?, memory_status = ?, source_turn_id = COALESCE(?, source_turn_id), expires_at = COALESCE(?, expires_at), conflict_group = COALESCE(?, conflict_group), updated_at = ?, last_accessed_at = ? WHERE id = ?",
-                (fact, tag, new_conf, new_prio, new_rel, self._status(new_rel), source_turn_id, expires_at, conflict_group, now, now, int(existing["id"])),
+                "UPDATE facts SET fact = ?, tag = ?, confidence = ?, priority = ?, hit_count = hit_count + 1, relevance_score = ?, relevance_base = MAX(COALESCE(relevance_base, 1.0), ?), memory_status = ?, source_turn_id = COALESCE(?, source_turn_id), expires_at = COALESCE(?, expires_at), conflict_group = COALESCE(?, conflict_group), updated_at = ?, last_accessed_at = ? WHERE id = ?",
+                (fact, tag, new_conf, new_prio, new_rel, float(confidence), self._status(new_rel), source_turn_id, expires_at, conflict_group, now, now, int(existing["id"])),
                 commit=True,
             )
             return
 
         self._exec(
-            "INSERT INTO facts(session_id, user_id, tenant_id, memory_scope, memory_type, memory_status, relevance_score, fact_key, fact, tag, confidence, source_turn_id, expires_at, priority, hit_count, conflict_group, created_at, updated_at, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, user_id, tenant_id, memory_scope, memory_type, "active", 1.0, fact_key, fact, tag, confidence, source_turn_id, expires_at, priority, 0, None, now, now, now),
+            "INSERT INTO facts(session_id, user_id, tenant_id, memory_scope, memory_type, memory_status, relevance_score, relevance_base, fact_key, fact, tag, confidence, source_turn_id, expires_at, priority, hit_count, conflict_group, created_at, updated_at, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, user_id, tenant_id, memory_scope, memory_type, "active", 1.0, 1.0, fact_key, fact, tag, confidence, source_turn_id, expires_at, priority, 0, None, now, now, now),
             commit=True,
         )
 
@@ -538,7 +543,7 @@ class MemoryEngine:
         q = f"%{query}%"
         rows = self._exec(
             """
-            SELECT id, fact, relevance_score, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed
+            SELECT id, fact, relevance_score, COALESCE(relevance_base, 1.0) AS relevance_base, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed
             FROM facts
             WHERE tenant_id = ? AND user_id = ?
               AND (session_id = ? OR memory_scope IN ('user','tenant'))
@@ -555,7 +560,7 @@ class MemoryEngine:
 
         out: List[str] = []
         for r in rows:
-            new_rel = self._relevance(float(r["relevance_score"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
+            new_rel = self._relevance(float(r["relevance_base"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
             self._exec(
                 "UPDATE facts SET hit_count = hit_count + 1, relevance_score = ?, memory_status = ?, last_accessed_at = ?, updated_at = ? WHERE id = ?",
                 (new_rel, self._status(new_rel), now, now, int(r["id"])),
@@ -573,13 +578,13 @@ class MemoryEngine:
             return []
         prev_session = str(row["session_id"])
         rows = self._exec(
-            "SELECT id, fact, relevance_score, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? ORDER BY relevance_score DESC, updated_at DESC LIMIT ?",
+            "SELECT id, fact, relevance_score, COALESCE(relevance_base, 1.0) AS relevance_base, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? ORDER BY relevance_score DESC, updated_at DESC LIMIT ?",
             (tenant_id, user_id, prev_session, limit),
         ).fetchall()
         now = int(time.time())
         facts = []
         for r in rows:
-            new_rel = self._relevance(float(r["relevance_score"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
+            new_rel = self._relevance(float(r["relevance_base"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
             self._exec(
                 "UPDATE facts SET hit_count = hit_count + 1, relevance_score = ?, memory_status = ?, last_accessed_at = ?, updated_at = ? WHERE id = ?",
                 (new_rel, self._status(new_rel), now, now, int(r["id"])),
@@ -625,8 +630,8 @@ class MemoryEngine:
         now = int(time.time())
         if row:
             self._exec(
-                "UPDATE relations SET strength = MAX(strength, ?), created_at = ? WHERE id = ?",
-                (strength, now, int(row["id"])),
+                "UPDATE relations SET strength = MAX(strength, ?) WHERE id = ?",
+                (strength, int(row["id"])),
                 commit=True,
             )
             return
@@ -705,7 +710,7 @@ class MemoryEngine:
             pending_reflection = self.get_pending_reflection(tenant_id=tenant_id, user_id=user_id)
             if pending_reflection:
                 blocks.append(self._format_block("Ausstehende Reflexion", [f"id={pending_reflection['id']} tokens={pending_reflection['tokens_requested']}"], 40))
-            pending_props = self.get_pending_proposals(tenant_id=tenant_id, limit=3)
+            pending_props = self.get_pending_proposals(tenant_id=tenant_id, agent_name=user_id, limit=3)
             if pending_props:
                 prop_lines = [f"[{p['agent_name']}] {p['target_store']}:{p['proposal_type']}" for p in pending_props]
                 blocks.append(self._format_block("Ausstehende Proposals", prop_lines, 50))
@@ -918,24 +923,24 @@ class MemoryEngine:
         tokens = max(256, min(tokens, self.config.reflection_max_tokens))
         if custom_elements is None:
             custom_elements = ["highlights", "insights", "learnings", "questions", "next_steps"]
-        self._exec(
+        cur = self._exec(
             "UPDATE reflection_queue SET status = 'approved', approved_at = ?, updated_at = ?, tokens_used = ?, elements_used = ? WHERE id = ? AND tenant_id = ? AND user_id = ? AND status = 'pending'",
             (now, now, tokens, json.dumps(custom_elements, ensure_ascii=False), reflection_id, tenant_id, user_id),
             commit=True,
         )
-        ok = (self._exec("SELECT changes() AS c").fetchone()["c"] or 0) > 0
+        ok = (cur.rowcount or 0) > 0
         if ok:
             self._log_audit(tenant_id, user_id, "reflection_approve", "reflection_queue", reflection_id, {"approved_tokens": tokens, "elements": custom_elements})
         return bool(ok)
 
     def reject_reflection(self, reflection_id: int, tenant_id: str, user_id: str, rejection_reason: str = "") -> bool:
         now = int(time.time())
-        self._exec(
+        cur = self._exec(
             "UPDATE reflection_queue SET status = 'rejected', rejected_at = ?, updated_at = ?, rejection_reason = ? WHERE id = ? AND tenant_id = ? AND user_id = ? AND status IN ('pending','approved')",
             (now, now, rejection_reason[:240], reflection_id, tenant_id, user_id),
             commit=True,
         )
-        ok = (self._exec("SELECT changes() AS c").fetchone()["c"] or 0) > 0
+        ok = (cur.rowcount or 0) > 0
         if ok:
             self._log_audit(tenant_id, user_id, "reflection_reject", "reflection_queue", reflection_id, {"reason": rejection_reason[:240]})
         return bool(ok)
@@ -1148,9 +1153,12 @@ class MemoryEngine:
                         tenant_id=tenant_id,
                     )
                 elif proposal_type == "delete":
+                    pattern = str(data.get("pattern", "")).strip()
+                    if not pattern:
+                        return False
                     self.forget_facts(
                         session_id=str(data.get("session_id", "default")),
-                        pattern=str(data.get("pattern", "")),
+                        pattern=pattern,
                         user_id=str(data.get("user_id", "anonymous")),
                         tenant_id=tenant_id,
                     )
@@ -1294,16 +1302,30 @@ class MemoryEngine:
             return best_response
         return None
 
-    def apply_fact_maintenance(self) -> int:
+    def apply_fact_maintenance(self, tenant_id: Optional[str] = None, user_id: Optional[str] = None, session_id: Optional[str] = None) -> int:
         now = int(time.time())
         stale_cutoff = now - self.config.stale_fact_days * 24 * 3600
         unhit_cutoff = now - self.config.unhit_fact_days * 24 * 3600
 
+        where_parts = []
+        params: list = []
+        if tenant_id is not None:
+            where_parts.append("tenant_id = ?")
+            params.append(tenant_id)
+        if user_id is not None:
+            where_parts.append("user_id = ?")
+            params.append(user_id)
+        if session_id is not None:
+            where_parts.append("session_id = ?")
+            params.append(session_id)
+        where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
         rows = self._exec(
-            "SELECT id, relevance_score, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts"
+            f"SELECT id, relevance_score, COALESCE(relevance_base, 1.0) AS relevance_base, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts{where_sql}",
+            tuple(params),
         ).fetchall()
         for r in rows:
-            score = self._relevance(float(r["relevance_score"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
+            score = self._relevance(float(r["relevance_base"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
             self._exec(
                 "UPDATE facts SET relevance_score = ?, memory_status = ?, updated_at = ? WHERE id = ?",
                 (score, self._status(score), now, int(r["id"])),
@@ -1311,20 +1333,20 @@ class MemoryEngine:
             )
 
         self._exec(
-            "UPDATE facts SET priority = CASE WHEN priority > 1 THEN priority - 1 ELSE 1 END, updated_at = ? WHERE updated_at < ?",
-            (now, stale_cutoff),
+            f"UPDATE facts SET priority = CASE WHEN priority > 1 THEN priority - 1 ELSE 1 END, updated_at = ? WHERE updated_at < ?" + (" AND " + " AND ".join(where_parts) if where_parts else ""),
+            (now, stale_cutoff, *params),
             commit=True,
         )
 
         deleted_unhit = self._exec(
-            "DELETE FROM facts WHERE hit_count = 0 AND created_at < ? AND memory_scope = 'session'",
-            (unhit_cutoff,),
+            f"DELETE FROM facts WHERE hit_count = 0 AND created_at < ? AND memory_scope = 'session'" + (" AND " + " AND ".join(where_parts) if where_parts else ""),
+            (unhit_cutoff, *params),
             commit=True,
         ).rowcount or 0
 
         deleted_archived = self._exec(
-            "DELETE FROM facts WHERE relevance_score < ? AND memory_scope = 'session'",
-            (self.config.archive_threshold,),
+            f"DELETE FROM facts WHERE relevance_score < ? AND memory_scope = 'session'" + (" AND " + " AND ".join(where_parts) if where_parts else ""),
+            (self.config.archive_threshold, *params),
             commit=True,
         ).rowcount or 0
 
