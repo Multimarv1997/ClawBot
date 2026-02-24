@@ -526,9 +526,15 @@ class MemoryEngine:
             conflict_group = None
             old_fact = str(existing["fact"]).lower()
             new_fact = fact.lower()
-            neg_markers = ("nicht", "not", "never", "kein", "keine", "no ")
-            old_neg = any(m in old_fact for m in neg_markers)
-            new_neg = any(m in new_fact for m in neg_markers)
+            neg_patterns = [
+                re.compile(r"\bnicht\b", re.IGNORECASE),
+                re.compile(r"\bnot\b", re.IGNORECASE),
+                re.compile(r"\bnever\b", re.IGNORECASE),
+                re.compile(r"\bkein(?:e|er|em|en)?\b", re.IGNORECASE),
+                re.compile(r"\bno\b", re.IGNORECASE),
+            ]
+            old_neg = any(p.search(old_fact) for p in neg_patterns)
+            new_neg = any(p.search(new_fact) for p in neg_patterns)
             if old_neg != new_neg:
                 conflict_group = fact_key
             self._exec(
@@ -866,10 +872,13 @@ class MemoryEngine:
                     out[-1]["details"] = {"_raw": str(r["details"]), "_decode_error": True}
         return out
 
-    def cleanup_old_audit_logs(self, retention_days: Optional[int] = None) -> int:
+    def cleanup_old_audit_logs(self, retention_days: Optional[int] = None, tenant_id: Optional[str] = None) -> int:
         days = retention_days if retention_days is not None else self.config.audit_retention_days
         cutoff = int(time.time()) - days * 24 * 3600
-        deleted = self._exec("DELETE FROM audit_log WHERE created_at < ?", (cutoff,), commit=True).rowcount or 0
+        if tenant_id is None:
+            deleted = self._exec("DELETE FROM audit_log WHERE created_at < ?", (cutoff,), commit=True).rowcount or 0
+        else:
+            deleted = self._exec("DELETE FROM audit_log WHERE tenant_id = ? AND created_at < ?", (tenant_id, cutoff), commit=True).rowcount or 0
         return int(deleted)
 
     def cleanup_stale_phase_d_state(self, tenant_id: Optional[str] = None) -> dict:
@@ -904,7 +913,7 @@ class MemoryEngine:
             (proposal_cutoff, *tenant_params),
             commit=True,
         ).rowcount or 0
-        old_audit = self.cleanup_old_audit_logs() if tenant_id is None else 0
+        old_audit = self.cleanup_old_audit_logs(tenant_id=tenant_id)
         return {"expired_proposals": int(expired_proposals), "deleted_reflection_queue_rows": int(old_reflections), "deleted_audit_rows": int(old_audit)}
 
     def phase_d_health(self, tenant_id: str, user_id: str) -> dict:
@@ -1198,11 +1207,13 @@ class MemoryEngine:
         if not row:
             return False
         now = int(time.time())
-        self._exec(
+        cur = self._exec(
             "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND status = 'pending'",
             (reviewer_agent, rejection_reason[:240], now, now, proposal_id, tenant_id),
             commit=True,
         )
+        if (cur.rowcount or 0) <= 0:
+            return False
         self._log_audit(tenant_id, f"agent:{reviewer_agent}", "proposal_reject", str(row["target_store"]), proposal_id, {"original_agent": str(row["agent_name"]), "proposal_type": str(row["proposal_type"]), "reason": rejection_reason[:240]})
         return True
 
@@ -1399,7 +1410,7 @@ class MemoryEngine:
         select_sql = "SELECT id, relevance_score, COALESCE(relevance_base, 1.0) AS relevance_base, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts" + where_sql + status_filter
         rows = self._exec(select_sql, tuple(params)).fetchall()
         for r in rows:
-            score = self._relevance(float(r["relevance_base"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
+            score = self._relevance(float(r["relevance_base"]), int(r["last_accessed"]), max(1, int(r["hit_count"])), str(r["memory_type"]))
             self._exec(
                 "UPDATE facts SET relevance_score = ?, memory_status = ?, updated_at = ? WHERE id = ?",
                 (score, self._status(score), now, int(r["id"])),

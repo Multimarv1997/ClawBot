@@ -105,11 +105,38 @@ def _parse_llm_json(raw: str) -> Any:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
+        def _extract_balanced(s: str, open_ch: str, close_ch: str) -> Optional[str]:
+            start = s.find(open_ch)
+            if start < 0:
+                return None
+            depth = 0
+            for i in range(start, len(s)):
+                ch = s[i]
+                if ch == open_ch:
+                    depth += 1
+                elif ch == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        return s[start:i + 1]
+            return None
+
         match = re.search(r"(\[.*?\]|\{.*?\})", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(1))
             except json.JSONDecodeError:
+                obj = _extract_balanced(text, "{", "}")
+                if obj:
+                    try:
+                        return json.loads(obj)
+                    except json.JSONDecodeError:
+                        pass
+                arr = _extract_balanced(text, "[", "]")
+                if arr:
+                    try:
+                        return json.loads(arr)
+                    except json.JSONDecodeError:
+                        pass
                 return None
         return None
 
@@ -191,11 +218,12 @@ def maybe_extract_fact(user_prompt: str) -> Optional[tuple[str, str, float, str]
 
 def maybe_generate_summary(session_id: str, user_id: str, tenant_id: str) -> None:
     scope = (tenant_id, user_id, session_id)
-    if SUMMARY_RETRY_AFTER:
-        now = time.time()
-        stale = [k for k, ts in SUMMARY_RETRY_AFTER.items() if ts <= now]
-        for k in stale:
-            SUMMARY_RETRY_AFTER.pop(k, None)
+    with MAINTENANCE_LOCK:
+        if SUMMARY_RETRY_AFTER:
+            now = time.time()
+            stale = [k for k, ts in SUMMARY_RETRY_AFTER.items() if ts <= now]
+            for k in stale:
+                SUMMARY_RETRY_AFTER.pop(k, None)
     retry_after = SUMMARY_RETRY_AFTER.get(scope, 0.0)
     if retry_after > time.time():
         return
@@ -215,7 +243,8 @@ def maybe_generate_summary(session_id: str, user_id: str, tenant_id: str) -> Non
         summary_text = scrub_pii(call_gemini(summary_prompt))
         if summary_text.startswith("[Fehler]") or summary_text.startswith("[Demo-Antwort]"):
             logger.warning("Skipping summary write due to Gemini error/demo response")
-            SUMMARY_RETRY_AFTER[scope] = time.time() + SUMMARY_RETRY_DELAY_S
+            with MAINTENANCE_LOCK:
+                SUMMARY_RETRY_AFTER[scope] = time.time() + SUMMARY_RETRY_DELAY_S
             return
         engine.create_summary(
             session_id,
