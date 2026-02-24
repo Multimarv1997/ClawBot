@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import os
@@ -127,7 +128,8 @@ def scrub_pii(text: str) -> str:
 def local_fallback_embedding(text: str, dim: int = 64) -> List[float]:
     vec = [0.0] * dim
     for tok in text.lower().split():
-        vec[hash(tok) % dim] += 1.0
+        idx = int(hashlib.sha256(tok.encode("utf-8")).hexdigest(), 16) % dim
+        vec[idx] += 1.0
     norm = sum(x * x for x in vec) ** 0.5
     return [x / norm for x in vec] if norm else vec
 
@@ -374,12 +376,15 @@ def chat() -> Any:
         if not forget_pattern:
             forget_pattern = user_prompt
         deleted = engine.forget_facts(session_id=session_id, pattern=forget_pattern, user_id=user_id, tenant_id=tenant_id)
+        reply = f"Ich habe {deleted} passende Erinnerungen entfernt."
+        engine.remember_turn(session_id, "assistant", reply, user_id=user_id, tenant_id=tenant_id)
         engine.record_metric(session_id, "trigger_forget_hit", 1, user_id=user_id, tenant_id=tenant_id)
-        return jsonify({"response": f"Ich habe {deleted} passende Erinnerungen entfernt.", "source": "trigger_forget", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
+        return jsonify({"response": reply, "source": "trigger_forget", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
 
     reflection_signal = reflection_handler.handle(user_prompt, tenant_id=tenant_id, user_id=user_id)
     if reflection_signal:
         engine.remember_turn(session_id, "user", user_prompt, user_id=user_id, tenant_id=tenant_id)
+        engine.remember_turn(session_id, "assistant", reflection_signal["message"], user_id=user_id, tenant_id=tenant_id)
         engine.record_metric(session_id, "trigger_reflect_hit", 1, user_id=user_id, tenant_id=tenant_id)
         return jsonify({
             "response": reflection_signal["message"],
@@ -586,6 +591,12 @@ def api_proposal_pending() -> Any:
 @app.post("/api/proposal/review")
 def api_proposal_review() -> Any:
     body = request.get_json(force=True)
+    reviewer_agent = str(body.get("reviewer_agent", ""))
+    reviewer = engine.get_agent(str(body.get("tenant_id", "default")), reviewer_agent)
+    if not reviewer:
+        return jsonify({"error": "reviewer_agent unknown or inactive"}), 404
+    if reviewer.get("permissions") != "write":
+        return jsonify({"error": "reviewer_agent lacks write permission"}), 403
     action = str(body.get("action", "")).strip().lower()
     if action not in {"approve", "reject"}:
         return jsonify({"error": "action muss approve oder reject sein"}), 400
@@ -593,14 +604,14 @@ def api_proposal_review() -> Any:
         ok = engine.approve_proposal(
             proposal_id=_safe_int(body.get("proposal_id", 0), 0, minimum=0),
             tenant_id=str(body.get("tenant_id", "default")),
-            reviewer_agent=str(body.get("reviewer_agent", "")),
+            reviewer_agent=reviewer_agent,
             review_comment=str(body.get("comment", "")),
         )
     else:
         ok = engine.reject_proposal(
             proposal_id=_safe_int(body.get("proposal_id", 0), 0, minimum=0),
             tenant_id=str(body.get("tenant_id", "default")),
-            reviewer_agent=str(body.get("reviewer_agent", "")),
+            reviewer_agent=reviewer_agent,
             rejection_reason=str(body.get("comment", "")),
         )
     return (jsonify({"status": "success"}), 200) if ok else (jsonify({"error": "review failed"}), 400)

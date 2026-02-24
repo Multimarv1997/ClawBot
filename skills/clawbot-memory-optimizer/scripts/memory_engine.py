@@ -32,15 +32,15 @@ class MemoryConfig:
     decay_lambda: float = 0.03
     archive_threshold: float = 0.05
     context_token_budget: int = 700
-    context_block_budget_identity: int = 120
-    context_block_budget_soul: int = 120
-    context_block_budget_summary: int = 120
-    context_block_budget_facts: int = 100
-    context_block_budget_prev_facts: int = 70
-    context_block_budget_trends: int = 50
-    context_block_budget_graph_entities: int = 60
-    context_block_budget_graph_relations: int = 60
-    context_block_budget_recent_turns: int = 160
+    context_block_budget_identity: int = 100
+    context_block_budget_soul: int = 100
+    context_block_budget_summary: int = 80
+    context_block_budget_facts: int = 90
+    context_block_budget_prev_facts: int = 50
+    context_block_budget_trends: int = 40
+    context_block_budget_graph_entities: int = 50
+    context_block_budget_graph_relations: int = 50
+    context_block_budget_recent_turns: int = 140
     # Phase D1
     reflection_baseline_tokens: int = 8000
     reflection_max_tokens: int = 16000
@@ -95,7 +95,11 @@ class MemoryEngine:
             raise ValueError(f"unsupported table for schema migration: {table}")
         cols = [r[1] for r in self._exec(f"PRAGMA table_info({table})").fetchall()]
         if column_name not in cols:
-            self._exec(f"ALTER TABLE {table} ADD COLUMN {column_def}", commit=True)
+            try:
+                self._exec(f"ALTER TABLE {table} ADD COLUMN {column_def}", commit=True)
+            except sqlite3.OperationalError as err:
+                if "duplicate column name" not in str(err).lower():
+                    raise
 
     def init_db(self) -> None:
         self._exec(
@@ -682,8 +686,13 @@ class MemoryEngine:
 
     def needs_summary(self, session_id: str, user_id: str = "anonymous", tenant_id: str = "default") -> bool:
         row = self._exec(
-            "SELECT COUNT(*) AS c FROM interactions WHERE tenant_id = ? AND user_id = ? AND session_id = ?",
+            "SELECT COALESCE(MAX(to_turn_id), 0) AS last_to FROM summaries WHERE tenant_id = ? AND user_id = ? AND session_id = ?",
             (tenant_id, user_id, session_id),
+        ).fetchone()
+        last_to = int(row["last_to"]) if row else 0
+        row = self._exec(
+            "SELECT COUNT(*) AS c FROM interactions WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND id > ?",
+            (tenant_id, user_id, session_id, last_to),
         ).fetchone()
         return int(row["c"]) >= self.config.summarizer_turn_threshold
 
@@ -846,9 +855,14 @@ class MemoryEngine:
                 "action_type": str(r["action_type"]),
                 "target_store": str(r["target_store"]) if r["target_store"] else "",
                 "target_id": int(r["target_id"]) if r["target_id"] is not None else None,
-                "details": json.loads(r["details"]) if r["details"] else {},
+                "details": {},
                 "created_at": int(r["created_at"]),
             })
+            if r["details"]:
+                try:
+                    out[-1]["details"] = json.loads(r["details"])
+                except json.JSONDecodeError:
+                    out[-1]["details"] = {"_raw": str(r["details"]), "_decode_error": True}
         return out
 
     def cleanup_old_audit_logs(self, retention_days: Optional[int] = None) -> int:
@@ -1158,8 +1172,8 @@ class MemoryEngine:
         )
         if not ok:
             self._exec(
-                "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND status = 'approved'",
-                (reviewer_agent, "execution_failed", now, now, proposal_id, tenant_id),
+                "UPDATE memory_proposals SET status = 'rejected', reviewed_by = NULL, review_comment = NULL, approved_at = NULL, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND status = 'approved'",
+                ("execution_failed", now, now, proposal_id, tenant_id),
                 commit=True,
             )
             self._log_audit(tenant_id, f"agent:{reviewer_agent}", "proposal_reject", str(row["target_store"]), proposal_id, {"original_agent": str(row["agent_name"]), "proposal_type": str(row["proposal_type"]), "reason": "execution_failed"})
@@ -1184,7 +1198,7 @@ class MemoryEngine:
             return False
         now = int(time.time())
         self._exec(
-            "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ?",
+            "UPDATE memory_proposals SET status = 'rejected', reviewed_by = ?, rejection_reason = ?, rejected_at = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND status = 'pending'",
             (reviewer_agent, rejection_reason[:240], now, now, proposal_id, tenant_id),
             commit=True,
         )
@@ -1429,8 +1443,6 @@ class MemoryEngine:
         exact = self._exec("DELETE FROM exact_cache_entries" + where_sql, tuple(params), commit=True).rowcount or 0
         semantic = self._exec("DELETE FROM semantic_cache_entries" + where_sql, tuple(params), commit=True).rowcount or 0
         deleted_facts = self._exec("DELETE FROM facts WHERE expires_at IS NOT NULL AND " + " AND ".join(where_parts), tuple(params), commit=True).rowcount or 0
-        if tenant_id is not None or user_id is not None or session_id is not None:
-            deleted_facts += self.apply_fact_maintenance(tenant_id=tenant_id, user_id=user_id, session_id=session_id)
         return int(exact + semantic + deleted_facts)
 
 
