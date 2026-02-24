@@ -2,12 +2,13 @@
 
 Installierbarer Skill für ClawBot mit disk-first Memory, exact/semantic cache, PII-Filter, Summaries, Fact-Extraktion und Multi-Scope-Isolation.
 
-## Gezielt ausgebaut
-- Vorhandene Funktionen wurden erweitert (kein Rewrite)
-- Race-sicherer Summarizer mit Session-Lock
-- Aktives Cross-Session-Recall im Kontextaufbau
-- Fact-Merge, Conflict-Markierung und Wartungslogik für Vergessen
-- Embedding-Hygiene inklusive Cleanup fehlerhafter Einträge
+## Phase A umgesetzt (ROI hoch)
+- Decay-basiertes Vergessen mit Relevanz-Score und Status
+- Natural Language Triggers (`remember`, `forget`, `reflect`)
+- Trigger-/Topic-Metriken zur Beobachtung
+
+## Für Phase B/C vorbereitet
+- Datenbankschema für Wissensgraph/Identity ist angelegt (`entities`, `relations`, `identity`, `soul`)
 
 ## API
 - `POST /chat` mit `{ "tenant_id":"acme", "user_id":"alice", "session_id":"s1", "prompt":"..." }`

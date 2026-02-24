@@ -28,6 +28,17 @@ class MemoryConfig:
     summarizer_turn_threshold: int = 20
     stale_fact_days: int = 30
     unhit_fact_days: int = 7
+    decay_lambda: float = 0.03
+    archive_threshold: float = 0.05
+
+
+TYPE_WEIGHTS = {
+    "core": 1.5,
+    "semantic": 1.2,
+    "episodic": 0.8,
+    "procedural": 1.0,
+    "vault": 9999.0,
+}
 
 
 class MemoryEngine:
@@ -86,6 +97,9 @@ class MemoryEngine:
                 user_id TEXT NOT NULL DEFAULT 'anonymous',
                 tenant_id TEXT NOT NULL DEFAULT 'default',
                 memory_scope TEXT NOT NULL DEFAULT 'session',
+                memory_type TEXT NOT NULL DEFAULT 'semantic',
+                memory_status TEXT NOT NULL DEFAULT 'active',
+                relevance_score REAL NOT NULL DEFAULT 1.0,
                 fact_key TEXT,
                 fact TEXT NOT NULL,
                 tag TEXT,
@@ -96,7 +110,8 @@ class MemoryEngine:
                 hit_count INTEGER NOT NULL DEFAULT 0,
                 conflict_group TEXT,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                last_accessed_at INTEGER
             )
             """,
             commit=True,
@@ -106,6 +121,9 @@ class MemoryEngine:
             ("user_id TEXT NOT NULL DEFAULT 'anonymous'", "user_id"),
             ("tenant_id TEXT NOT NULL DEFAULT 'default'", "tenant_id"),
             ("memory_scope TEXT NOT NULL DEFAULT 'session'", "memory_scope"),
+            ("memory_type TEXT NOT NULL DEFAULT 'semantic'", "memory_type"),
+            ("memory_status TEXT NOT NULL DEFAULT 'active'", "memory_status"),
+            ("relevance_score REAL NOT NULL DEFAULT 1.0", "relevance_score"),
             ("fact_key TEXT", "fact_key"),
             ("confidence REAL NOT NULL DEFAULT 1.0", "confidence"),
             ("source_turn_id INTEGER", "source_turn_id"),
@@ -113,9 +131,10 @@ class MemoryEngine:
             ("hit_count INTEGER NOT NULL DEFAULT 0", "hit_count"),
             ("conflict_group TEXT", "conflict_group"),
             ("updated_at INTEGER NOT NULL DEFAULT 0", "updated_at"),
+            ("last_accessed_at INTEGER", "last_accessed_at"),
         ]:
             self._ensure_column("facts", col_def, col_name)
-        self._exec("CREATE INDEX IF NOT EXISTS idx_facts_scope_priority ON facts(tenant_id, user_id, session_id, memory_scope, priority DESC, confidence DESC, hit_count DESC, updated_at DESC)", commit=True)
+        self._exec("CREATE INDEX IF NOT EXISTS idx_facts_scope_priority ON facts(tenant_id, user_id, session_id, memory_scope, memory_status, relevance_score DESC, priority DESC, confidence DESC, hit_count DESC, updated_at DESC)", commit=True)
 
         self._exec(
             """
@@ -198,12 +217,89 @@ class MemoryEngine:
         )
         self._exec("CREATE INDEX IF NOT EXISTS idx_metrics_scope_metric_time ON metrics(tenant_id, user_id, session_id, metric_name, created_at DESC)", commit=True)
 
+        # Phase B/C vorbereitet
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                entity_name TEXT NOT NULL,
+                entity_type TEXT,
+                description TEXT,
+                confidence REAL DEFAULT 1.0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """,
+            commit=True,
+        )
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                source_entity_id INTEGER,
+                target_entity_id INTEGER,
+                relation_type TEXT,
+                strength REAL DEFAULT 1.0,
+                created_at INTEGER NOT NULL
+            )
+            """,
+            commit=True,
+        )
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS identity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                content TEXT NOT NULL,
+                stability TEXT DEFAULT 'stable',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """,
+            commit=True,
+        )
+        self._exec(
+            """
+            CREATE TABLE IF NOT EXISTS soul (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """,
+            commit=True,
+        )
+
     def _scope(self, session_id: str, user_id: str, tenant_id: str) -> tuple[str, str, str]:
         return tenant_id, user_id, session_id
 
     @staticmethod
     def normalize_fact_key(text: str) -> str:
         return re.sub(r"\s+", " ", re.sub(r"[^\w\säöüÄÖÜß]", "", text.lower())).strip()
+
+    def _relevance(self, base: float, last_accessed: int, access_count: int, memory_type: str) -> float:
+        if memory_type == "vault":
+            return 1.0
+        days = max(0.0, (time.time() - last_accessed) / 86400.0)
+        weight = TYPE_WEIGHTS.get(memory_type, 1.0)
+        return max(0.0, min(1.0, base * math.exp(-self.config.decay_lambda * days) * math.log2(access_count + 1) * weight))
+
+    @staticmethod
+    def _status(score: float) -> str:
+        if score >= 0.5:
+            return "active"
+        if score >= 0.2:
+            return "fading"
+        if score >= 0.05:
+            return "dormant"
+        return "archived"
 
     def record_metric(self, session_id: str, metric_name: str, value: float = 1.0, user_id: str = "anonymous", tenant_id: str = "default") -> None:
         self._exec(
@@ -247,11 +343,7 @@ class MemoryEngine:
 
     def try_acquire_summary_lock(self, session_id: str, user_id: str = "anonymous", tenant_id: str = "default", ttl_s: int = 120) -> bool:
         now = int(time.time())
-        self._exec(
-            "DELETE FROM summary_locks WHERE locked_at < ?",
-            (now - ttl_s,),
-            commit=True,
-        )
+        self._exec("DELETE FROM summary_locks WHERE locked_at < ?", (now - ttl_s,), commit=True)
         try:
             self._exec(
                 "INSERT INTO summary_locks(tenant_id, user_id, session_id, locked_at) VALUES (?, ?, ?, ?)",
@@ -269,53 +361,75 @@ class MemoryEngine:
             commit=True,
         )
 
-    def remember_fact(self, session_id: str, fact: str, tag: str = "general", priority: int = 1, confidence: float = 1.0, source_turn_id: Optional[int] = None, expires_at: Optional[int] = None, memory_scope: str = "session", user_id: str = "anonymous", tenant_id: str = "default") -> None:
+    def remember_fact(self, session_id: str, fact: str, tag: str = "general", priority: int = 1, confidence: float = 1.0, source_turn_id: Optional[int] = None, expires_at: Optional[int] = None, memory_scope: str = "session", memory_type: str = "semantic", user_id: str = "anonymous", tenant_id: str = "default") -> None:
         now = int(time.time())
         fact_key = self.normalize_fact_key(fact)
         existing = self._exec(
-            "SELECT id, confidence, priority, hit_count, fact FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND memory_scope = ? AND fact_key = ? LIMIT 1",
+            "SELECT id, confidence, priority, hit_count, fact, relevance_score FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND memory_scope = ? AND fact_key = ? LIMIT 1",
             (tenant_id, user_id, session_id, memory_scope, fact_key),
         ).fetchone()
 
         if existing:
             new_conf = max(float(existing["confidence"]), float(confidence))
             new_prio = max(int(existing["priority"]), int(priority))
+            new_rel = max(float(existing["relevance_score"]), 0.6)
             conflict_group = None
             old_fact = str(existing["fact"]).lower()
             new_fact = fact.lower()
             if ("nicht" in old_fact and "nicht" not in new_fact) or ("nicht" in new_fact and "nicht" not in old_fact):
                 conflict_group = fact_key
             self._exec(
-                "UPDATE facts SET fact = ?, tag = ?, confidence = ?, priority = ?, hit_count = hit_count + 1, source_turn_id = COALESCE(?, source_turn_id), expires_at = COALESCE(?, expires_at), conflict_group = COALESCE(?, conflict_group), updated_at = ? WHERE id = ?",
-                (fact, tag, new_conf, new_prio, source_turn_id, expires_at, conflict_group, now, int(existing["id"])),
+                "UPDATE facts SET fact = ?, tag = ?, confidence = ?, priority = ?, hit_count = hit_count + 1, relevance_score = ?, memory_status = ?, source_turn_id = COALESCE(?, source_turn_id), expires_at = COALESCE(?, expires_at), conflict_group = COALESCE(?, conflict_group), updated_at = ?, last_accessed_at = ? WHERE id = ?",
+                (fact, tag, new_conf, new_prio, new_rel, self._status(new_rel), source_turn_id, expires_at, conflict_group, now, now, int(existing["id"])),
                 commit=True,
             )
             return
 
         self._exec(
-            "INSERT INTO facts(session_id, user_id, tenant_id, memory_scope, fact_key, fact, tag, confidence, source_turn_id, expires_at, priority, hit_count, conflict_group, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, user_id, tenant_id, memory_scope, fact_key, fact, tag, confidence, source_turn_id, expires_at, priority, 0, None, now, now),
+            "INSERT INTO facts(session_id, user_id, tenant_id, memory_scope, memory_type, memory_status, relevance_score, fact_key, fact, tag, confidence, source_turn_id, expires_at, priority, hit_count, conflict_group, created_at, updated_at, last_accessed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, user_id, tenant_id, memory_scope, memory_type, "active", 1.0, fact_key, fact, tag, confidence, source_turn_id, expires_at, priority, 0, None, now, now, now),
             commit=True,
         )
+
+    def forget_facts(self, session_id: str, pattern: str, user_id: str = "anonymous", tenant_id: str = "default") -> int:
+        q = f"%{pattern}%"
+        deleted = self._exec(
+            "DELETE FROM facts WHERE tenant_id = ? AND user_id = ? AND (session_id = ? OR memory_scope IN ('user','tenant')) AND (fact LIKE ? OR tag LIKE ?)",
+            (tenant_id, user_id, session_id, q, q),
+            commit=True,
+        ).rowcount or 0
+        return int(deleted)
 
     def top_facts(self, session_id: str, query: str = "", limit: int = 5, user_id: str = "anonymous", tenant_id: str = "default") -> List[str]:
         now = int(time.time())
         q = f"%{query}%"
         rows = self._exec(
             """
-            SELECT fact FROM facts
+            SELECT id, fact, relevance_score, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed
+            FROM facts
             WHERE tenant_id = ? AND user_id = ?
               AND (session_id = ? OR memory_scope IN ('user','tenant'))
               AND (expires_at IS NULL OR expires_at > ?)
+              AND memory_status != 'archived'
               AND (? = '' OR fact LIKE ? OR tag LIKE ?)
             ORDER BY
               CASE memory_scope WHEN 'session' THEN 0 WHEN 'user' THEN 1 ELSE 2 END,
-              priority DESC, confidence DESC, hit_count DESC, updated_at DESC
+              relevance_score DESC, priority DESC, confidence DESC, hit_count DESC, updated_at DESC
             LIMIT ?
             """,
             (tenant_id, user_id, session_id, now, query, q, q, limit),
         ).fetchall()
-        return [str(r["fact"]) for r in rows]
+
+        out: List[str] = []
+        for r in rows:
+            new_rel = self._relevance(float(r["relevance_score"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
+            self._exec(
+                "UPDATE facts SET hit_count = hit_count + 1, relevance_score = ?, memory_status = ?, last_accessed_at = ?, updated_at = ? WHERE id = ?",
+                (new_rel, self._status(new_rel), now, now, int(r["id"])),
+                commit=True,
+            )
+            out.append(str(r["fact"]))
+        return out
 
     def previous_session_facts(self, session_id: str, user_id: str = "anonymous", tenant_id: str = "default", limit: int = 3) -> List[str]:
         row = self._exec(
@@ -326,10 +440,20 @@ class MemoryEngine:
             return []
         prev_session = str(row["session_id"])
         rows = self._exec(
-            "SELECT fact FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? ORDER BY updated_at DESC LIMIT ?",
+            "SELECT id, fact, relevance_score, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts WHERE tenant_id = ? AND user_id = ? AND session_id = ? ORDER BY relevance_score DESC, updated_at DESC LIMIT ?",
             (tenant_id, user_id, prev_session, limit),
         ).fetchall()
-        return [str(r["fact"]) for r in rows]
+        now = int(time.time())
+        facts = []
+        for r in rows:
+            new_rel = self._relevance(float(r["relevance_score"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
+            self._exec(
+                "UPDATE facts SET hit_count = hit_count + 1, relevance_score = ?, memory_status = ?, last_accessed_at = ?, updated_at = ? WHERE id = ?",
+                (new_rel, self._status(new_rel), now, now, int(r["id"])),
+                commit=True,
+            )
+            facts.append(str(r["fact"]))
+        return facts
 
     def tenant_topic_trends(self, tenant_id: str, limit: int = 3) -> List[str]:
         rows = self._exec(
@@ -474,17 +598,37 @@ class MemoryEngine:
         now = int(time.time())
         stale_cutoff = now - self.config.stale_fact_days * 24 * 3600
         unhit_cutoff = now - self.config.unhit_fact_days * 24 * 3600
+
+        rows = self._exec(
+            "SELECT id, relevance_score, hit_count, memory_type, COALESCE(last_accessed_at, created_at) AS last_accessed FROM facts"
+        ).fetchall()
+        for r in rows:
+            score = self._relevance(float(r["relevance_score"]), int(r["last_accessed"]), int(r["hit_count"]) + 1, str(r["memory_type"]))
+            self._exec(
+                "UPDATE facts SET relevance_score = ?, memory_status = ?, updated_at = ? WHERE id = ?",
+                (score, self._status(score), now, int(r["id"])),
+                commit=True,
+            )
+
         self._exec(
             "UPDATE facts SET priority = CASE WHEN priority > 1 THEN priority - 1 ELSE 1 END, updated_at = ? WHERE updated_at < ?",
             (now, stale_cutoff),
             commit=True,
         )
-        deleted = self._exec(
+
+        deleted_unhit = self._exec(
             "DELETE FROM facts WHERE hit_count = 0 AND created_at < ? AND memory_scope = 'session'",
             (unhit_cutoff,),
             commit=True,
         ).rowcount or 0
-        return int(deleted)
+
+        deleted_archived = self._exec(
+            "DELETE FROM facts WHERE relevance_score < ? AND memory_scope = 'session'",
+            (self.config.archive_threshold,),
+            commit=True,
+        ).rowcount or 0
+
+        return int(deleted_unhit + deleted_archived)
 
     def purge_expired_cache(self) -> int:
         now = int(time.time())

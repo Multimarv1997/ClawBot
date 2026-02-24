@@ -1,19 +1,18 @@
 # Architektur: zuverlässiges Memory für ClawBot
 
-## Fokus dieser Iteration
-1. **Gezielter Ausbau statt Rewrite**
-   - bestehende Robustheit/PII/Summary-Funktionen beibehalten und präzise erweitert
-2. **Race-sicherer Summarizer**
-   - Summary-Lock pro `(tenant,user,session)` verhindert doppelte Summaries bei parallelen Requests
-3. **Aktives Cross-Session-Recall**
-   - Kontext enthält zusätzlich Facts aus letzter Session und Tenant-Topic-Trends
-4. **Intelligente Fact-Verwaltung**
-   - Merge per `fact_key`, Konfliktmarkierung (`conflict_group`), Alterung/Pruning über Wartungslogik
-5. **Embedding-Hygiene**
-   - fehlerhafte/inkonsistente Embedding-Records werden erkannt und bereinigt
+## Phase A (umgesetzt)
+1. **Decay-basiertes Vergessen**
+   - `relevance_score` + `memory_status` (`active|fading|dormant|archived`)
+   - Decay-Logik bei Fact-Zugriff und in Wartungsjobs
+2. **Natural Language Triggers**
+   - Trigger für `remember`, `forget`, `reflect` im Proxy-Flow
+   - Trigger-Metriken zur Auswertung
+3. **Stabilität und Hygiene beibehalten**
+   - Summary-Locks, Embedding-Cleanup, PII-Schutz bleiben aktiv
+
+## Für Phase B/C vorbereitet
+- Tabellen vorbereitet: `entities`, `relations`, `identity`, `soul`
+- Fact-Schema vorbereitet mit `memory_type`, `relevance_score`, `memory_status`
 
 ## Kontextpipeline
 `summary -> top facts -> previous-session facts -> tenant trends -> recent turns`
-
-## Scope
-Alle Daten bleiben isoliert über `tenant_id`, `user_id`, `session_id`; Facts können zusätzlich scope-übergreifend gespeichert werden (`memory_scope`).

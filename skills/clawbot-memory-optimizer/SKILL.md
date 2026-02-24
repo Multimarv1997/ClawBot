@@ -19,3 +19,7 @@ description: "Installierbarer Skill für ClawBot mit RAM-sparendem SQLite-Memory
 
 12. Nutze den race-sicheren Summarizer-Lock (`summary_locks`) bei parallelen Requests.
 13. Nutze aktive Cross-Session-Context-Blöcke (letzte Session + Tenant-Trends) für besseres Recall.
+
+14. Aktiviere Trigger-Flow: `remember`, `forget`, `reflect` für automatische Memory-Aktionen.
+15. Nutze Decay-Model (`relevance_score`, `memory_status`) für priorisiertes Gedächtnis.
+16. Halte Phase-B/C-Tabellen (`entities`, `relations`, `identity`, `soul`) für spätere Ausbaustufe bereit.

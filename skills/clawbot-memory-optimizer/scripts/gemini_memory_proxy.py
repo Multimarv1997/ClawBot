@@ -39,6 +39,16 @@ FACT_PATTERNS = [
     (re.compile(r"\bbitte antworte\b", re.IGNORECASE), "style", 0.9, "session"),
 ]
 
+
+REMEMBER_TRIGGERS = ["remember", "don't forget", "keep in mind", "note that", "save this", "merke dir", "vergiss nicht", "wichtig"]
+FORGET_TRIGGERS = ["forget", "never mind", "disregard", "remove from memory", "vergiss", "streichen", "egal"]
+REFLECT_TRIGGERS = ["reflect", "review memory", "consolidate", "reflektiere", "gedächtnis prüfen"]
+
+
+def _has_any(text: str, patterns: list[str]) -> bool:
+    t = text.lower()
+    return any(p in t for p in patterns)
+
 app = Flask(__name__)
 engine = MemoryEngine()
 engine.init_db()
@@ -176,6 +186,17 @@ def chat() -> Any:
     if not user_prompt:
         return jsonify({"error": "prompt fehlt"}), 400
 
+    if _has_any(user_prompt, FORGET_TRIGGERS):
+        deleted = engine.forget_facts(session_id=session_id, pattern=user_prompt, user_id=user_id, tenant_id=tenant_id)
+        engine.record_metric(session_id, "trigger_forget_hit", 1, user_id=user_id, tenant_id=tenant_id)
+        return jsonify({"response": f"Ich habe {deleted} passende Erinnerungen entfernt.", "source": "trigger_forget", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
+
+    if _has_any(user_prompt, REFLECT_TRIGGERS):
+        maybe_generate_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id)
+        engine.record_metric(session_id, "trigger_reflect_hit", 1, user_id=user_id, tenant_id=tenant_id)
+        latest = engine.latest_summary(session_id=session_id, user_id=user_id, tenant_id=tenant_id) or "Noch keine Zusammenfassung vorhanden."
+        return jsonify({"response": latest, "source": "trigger_reflect", "session_id": session_id, "user_id": user_id, "tenant_id": tenant_id})
+
     engine.apply_fact_maintenance()
     track_topic_metrics(session_id, user_prompt, user_id, tenant_id)
     turn_id = engine.remember_turn(session_id, "user", user_prompt, user_id=user_id, tenant_id=tenant_id)
@@ -195,6 +216,8 @@ def chat() -> Any:
             tenant_id=tenant_id,
         )
         engine.record_metric(session_id, "fact_extracted_rule", 1, user_id=user_id, tenant_id=tenant_id)
+        if _has_any(user_prompt, REMEMBER_TRIGGERS):
+            engine.record_metric(session_id, "trigger_remember_hit", 1, user_id=user_id, tenant_id=tenant_id)
 
     llm_facts = extract_facts_with_llm(user_prompt)
     for f in llm_facts[:3]:
