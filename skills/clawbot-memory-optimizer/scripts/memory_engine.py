@@ -64,6 +64,14 @@ TYPE_WEIGHTS = {
 
 
 class MemoryEngine:
+    _NEG_PATTERNS: list[re.Pattern[str]] = [
+        re.compile(r"\bnicht\b", re.IGNORECASE),
+        re.compile(r"\bnot\b", re.IGNORECASE),
+        re.compile(r"\bnever\b", re.IGNORECASE),
+        re.compile(r"\bkein(?:e|er|em|en)?\b", re.IGNORECASE),
+        re.compile(r"\bno\b", re.IGNORECASE),
+    ]
+
     def __init__(self, config: Optional[MemoryConfig] = None) -> None:
         self.config = config or MemoryConfig()
         self.conn = sqlite3.connect(self.config.db_path, timeout=10, check_same_thread=False)
@@ -434,24 +442,14 @@ class MemoryEngine:
     def normalize_fact_key(text: str) -> str:
         return re.sub(r"\s+", " ", re.sub(r"[^\w\säöüÄÖÜß]", "", text.lower())).strip()
 
-    @staticmethod
-    def _negation_patterns() -> list[re.Pattern[str]]:
-        return [
-            re.compile(r"\bnicht\b", re.IGNORECASE),
-            re.compile(r"\bnot\b", re.IGNORECASE),
-            re.compile(r"\bnever\b", re.IGNORECASE),
-            re.compile(r"\bkein(?:e|er|em|en)?\b", re.IGNORECASE),
-            re.compile(r"\bno\b", re.IGNORECASE),
-        ]
-
     @classmethod
     def contains_negation(cls, text: str) -> bool:
-        return any(p.search(text) for p in cls._negation_patterns())
+        return any(p.search(text) for p in cls._NEG_PATTERNS)
 
     @classmethod
     def normalize_fact_key_without_negation(cls, text: str) -> str:
         cleaned = text
-        for p in cls._negation_patterns():
+        for p in cls._NEG_PATTERNS:
             cleaned = p.sub(" ", cleaned)
         return cls.normalize_fact_key(cleaned)
 
